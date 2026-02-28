@@ -21,6 +21,8 @@ battle_results*.json
 exploration_results*.json
 RESULTS*.md
 artifacts/campaign_log.json
+artifacts/memory/
+artifacts/screenshots/
 artifacts/results/*
 !artifacts/results/.gitkeep
 evals/runs/*

@@ -7,6 +7,7 @@ from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 
 from configs import (
+    RAM_ADDR_BADGES,
     DEFAULT_BATTLE_SEARCH_STEPS,
     DEFAULT_BATTLE_WAIT_TICKS,
     DEFAULT_BUTTON_HOLD_FRAMES,
@@ -27,6 +28,15 @@ from configs import (
     RAM_ADDR_PLAYER_MOVE_PP_3,
     RAM_ADDR_PLAYER_MOVE_PP_4,
     RAM_ADDR_PLAYER_SPECIES,
+    RAM_ADDR_PARTY_COUNT,
+    RAM_ADDR_PARTY_SPECIES_START,
+    RAM_ADDR_PARTY_MON_START,
+    PARTY_MON_STRUCT_SIZE,
+    PARTY_MON_LEVEL_OFFSET,
+    MAX_PARTY_SIZE,
+    RAM_ADDR_MAP_ID,
+    RAM_ADDR_X_POS,
+    RAM_ADDR_Y_POS,
 )
 from pokemon.gen1_data import effectiveness, move_meta, species_meta
 
@@ -73,6 +83,9 @@ class PokemonEmulator:
         for _ in range(max(frames, 1)):
             self.pyboy.tick()
 
+    def tick(self, frames: int = 1) -> None:
+        self._tick(frames=frames)
+
     def _read_byte(self, addr: int) -> int:
         if hasattr(self.pyboy, "get_memory_value"):
             return int(self.pyboy.get_memory_value(addr))
@@ -85,6 +98,9 @@ class PokemonEmulator:
         high = self._read_byte(high_addr)
         low = self._read_byte(high_addr + 1)
         return (high << 8) | low
+
+    def _player_hp_word(self) -> int:
+        return self._read_word_be(RAM_ADDR_PLAYER_HP)
 
     def press(self, button: str, frames: int = DEFAULT_BUTTON_HOLD_FRAMES) -> None:
         key = button.lower().strip()
@@ -109,6 +125,73 @@ class PokemonEmulator:
     def in_battle(self) -> bool:
         # Gen1 battle flag is non-zero in battle; trainer battles commonly use value 2.
         return self.read(RAM_ADDR_IN_BATTLE) != 0
+
+    def battle_flag(self) -> int:
+        return int(self.read(RAM_ADDR_IN_BATTLE))
+
+    def is_trainer_battle(self) -> bool:
+        return self.battle_flag() == 2
+
+    def is_wild_battle(self) -> bool:
+        return self.in_battle() and not self.is_trainer_battle()
+
+    def has_badge(self, badge_bit: int = 0) -> bool:
+        bit = max(0, int(badge_bit))
+        badges = int(self.read(RAM_ADDR_BADGES))
+        return (badges & (1 << bit)) != 0
+
+    def get_party_snapshot(self) -> Dict[str, object]:
+        raw_count = int(self.read(RAM_ADDR_PARTY_COUNT))
+        party_count = max(0, min(int(raw_count), int(MAX_PARTY_SIZE)))
+
+        species_ids: List[int] = []
+        levels: List[int] = []
+        for idx in range(party_count):
+            species_addr = int(RAM_ADDR_PARTY_SPECIES_START) + idx
+            species_id = int(self.read(species_addr))
+            if species_id in {0, 0xFF}:
+                continue
+            species_ids.append(species_id)
+            level_addr = (
+                int(RAM_ADDR_PARTY_MON_START)
+                + (idx * int(PARTY_MON_STRUCT_SIZE))
+                + int(PARTY_MON_LEVEL_OFFSET)
+            )
+            levels.append(max(0, int(self.read(level_addr))))
+
+        active_species_id = int(self.read(RAM_ADDR_PLAYER_SPECIES))
+        active_level = int(self.read(RAM_ADDR_PLAYER_LEVEL))
+
+        # Fallback for malformed/mid-transition memory where party list is empty but lead data exists.
+        if not species_ids and active_species_id > 0:
+            species_ids = [active_species_id]
+            levels = [max(0, active_level)]
+            party_count = 1
+
+        return {
+            "party_species_ids": [int(v) for v in species_ids],
+            "party_levels": [int(v) for v in levels],
+            "active_species_id": int(active_species_id),
+            "active_level": int(active_level),
+            "party_count": int(party_count),
+        }
+
+    def validate_single_species(self, required_species_id: int) -> tuple[bool, str, Dict[str, object]]:
+        required = int(required_species_id)
+        snapshot = self.get_party_snapshot()
+        party_count = int(snapshot.get("party_count", 0))
+        party_species = [int(v) for v in snapshot.get("party_species_ids", [])]
+        active_species_id = int(snapshot.get("active_species_id", 0))
+
+        if party_count < 1:
+            return False, "empty_party", snapshot
+        if party_count != 1:
+            return False, f"party_size_{party_count}", snapshot
+        if active_species_id != required:
+            return False, f"active_species_{active_species_id}_expected_{required}", snapshot
+        if not party_species or party_species[0] != required:
+            return False, f"party_species_mismatch_expected_{required}", snapshot
+        return True, "ok", snapshot
 
     def _move_ids(self) -> List[int]:
         return [
@@ -160,7 +243,7 @@ class PokemonEmulator:
     def get_battle_state(self) -> Dict[str, int | List[int]]:
         return {
             "in_battle": int(self.in_battle()),
-            "player_hp": self._read_word_be(RAM_ADDR_PLAYER_HP),
+            "player_hp": self._player_hp_word(),
             "player_max_hp": self._read_word_be(RAM_ADDR_PLAYER_MAX_HP),
             "player_level": self.read(RAM_ADDR_PLAYER_LEVEL),
             "player_species": self.read(RAM_ADDR_PLAYER_SPECIES),
@@ -170,6 +253,17 @@ class PokemonEmulator:
             "move_ids": self._move_ids(),
             "move_pps": self.get_move_pps(),
             "legal_slots": self.get_legal_move_slots(),
+        }
+
+    def get_nav_state(self) -> Dict[str, int]:
+        return {
+            "x": int(self.read(RAM_ADDR_X_POS)),
+            "y": int(self.read(RAM_ADDR_Y_POS)),
+            "map_id": int(self.read(RAM_ADDR_MAP_ID)),
+            "badges": int(self.read(RAM_ADDR_BADGES)),
+            "hp": int(self._player_hp_word()),
+            "level": int(self.read(RAM_ADDR_PLAYER_LEVEL)),
+            "in_battle": int(self.in_battle()),
         }
 
     def build_phase2_state(self, turn: int) -> Dict[str, object]:
@@ -239,7 +333,7 @@ class PokemonEmulator:
 
         slot = max(0, min(3, int(slot)))
         pp_before = self.get_move_pps()
-        player_hp_before = self._read_word_be(RAM_ADDR_PLAYER_HP)
+        player_hp_before = self._player_hp_word()
         enemy_hp_before = self._read_word_be(RAM_ADDR_ENEMY_HP)
 
         for _ in range(2):
@@ -250,15 +344,19 @@ class PokemonEmulator:
         return False
 
     def _normalize_to_fight_menu(self) -> None:
-        # Clear nested menus/dialog and bias cursor back to top-left command option (FIGHT).
+        # Clear nested menus/dialog and bias cursor to top-left command option (FIGHT).
+        self._normalize_to_command_menu()
+        self.press("a")
+        self._tick(DEFAULT_POST_INPUT_TICKS)
+
+    def _normalize_to_command_menu(self) -> None:
+        # Clear nested menus/dialog and anchor to top-left in the battle command menu.
         for _ in range(3):
             self.press("b")
             self._tick(max(1, DEFAULT_POST_INPUT_TICKS // 3))
         self.press("up", frames=2)
         self.press("left", frames=2)
         self._tick(2)
-        self.press("a")
-        self._tick(DEFAULT_POST_INPUT_TICKS)
 
     def _choose_move_slot(self, slot: int) -> None:
         # Move cursor memory can persist across turns; anchor to top-left first.
@@ -287,7 +385,7 @@ class PokemonEmulator:
                 return True
             self._tick(1)
 
-            player_hp_now = self._read_word_be(RAM_ADDR_PLAYER_HP)
+            player_hp_now = self._player_hp_word()
             enemy_hp_now = self._read_word_be(RAM_ADDR_ENEMY_HP)
             if player_hp_now != player_hp_before or enemy_hp_now != enemy_hp_before:
                 return True
@@ -324,6 +422,30 @@ class PokemonEmulator:
             if self.in_battle():
                 return True
         return False
+
+    def attempt_run(self, timeout_ticks: int = 240) -> bool:
+        """
+        Attempt to flee from battle by selecting RUN.
+        Returns True if battle exited, False otherwise.
+        """
+        if not self.in_battle():
+            return True
+
+        # Battle text boxes and command menus can interleave unpredictably.
+        # This loop advances text and repeatedly re-selects RUN from command menu.
+        total_ticks = max(80, int(timeout_ticks))
+        cycle_budget = max(4, total_ticks // 20)
+        for _ in range(cycle_budget):
+            for button in ("a", "b", "up", "left", "down", "right", "a"):
+                if not self.in_battle():
+                    return True
+                self.press(button, frames=2)
+                self._tick(3)
+            for _ in range(20):
+                if not self.in_battle():
+                    return True
+                self._tick(1)
+        return not self.in_battle()
 
     def stop(self) -> None:
         try:

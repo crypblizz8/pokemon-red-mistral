@@ -7,7 +7,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from mistralai import Mistral
+try:
+    from mistralai import Mistral
+except Exception:  # pragma: no cover - optional dependency in heuristic-only flows.
+    Mistral = None  # type: ignore[assignment]
+
+from pokemon.battle_memory import BattleMemory
 
 ACTION_RE = re.compile(r"ACTION\s*:\s*([0-3])", re.IGNORECASE)
 
@@ -100,8 +105,14 @@ class EpisodeRecord:
 
 
 class MistralBattleAgent:
-    def __init__(self, api_key: str, model: str, policy_mode: str = "llm") -> None:
-        self.client = Mistral(api_key=api_key)
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        policy_mode: str = "llm",
+        battle_memory: Optional[BattleMemory] = None,
+    ) -> None:
+        self.client = Mistral(api_key=api_key) if Mistral is not None else None
         self.model = model
         self.policy_mode = policy_mode
         self.strategy = (
@@ -119,6 +130,12 @@ class MistralBattleAgent:
         self.llm_decision_calls = 0
         self.llm_reflection_calls = 0
         self.budget_fallback_count = 0
+        self.battle_memory = battle_memory
+        self._episode_state_label = "unknown_state"
+        self._episode_state_index = -1
+        self._last_enemy_hp: int | None = None
+        self._last_chosen_slot: int | None = None
+        self._stagnation_count = 0
 
     def _extract_action(self, text: str) -> Optional[int]:
         match = ACTION_RE.search(text)
@@ -193,6 +210,56 @@ class MistralBattleAgent:
         legal_slots = self._legal_slots_from_state(state)
         return self._best_legal_slot(state, legal_slots)
 
+    def _best_alternate_slot(self, state: Dict[str, object], *, exclude_slot: int) -> int | None:
+        legal_slots = [slot for slot in self._legal_slots_from_state(state) if slot != int(exclude_slot)]
+        if not legal_slots:
+            return None
+        move_rows = self._move_info_by_slot(state)
+        damaging = [slot for slot in legal_slots if int(move_rows.get(slot, {}).get("power", 0)) > 0]
+        ranked = damaging if damaging else legal_slots
+        best_slot = ranked[0]
+        best_score = (-1.0, -1, 0)
+        for slot in ranked:
+            row = move_rows.get(slot, {})
+            score = (float(row.get("effectiveness", 1.0)), int(row.get("power", 0)), -slot)
+            if score > best_score:
+                best_score = score
+                best_slot = slot
+        return best_slot
+
+    def _apply_stagnation_override(self, state: Dict[str, object], chosen: int) -> tuple[int, bool]:
+        enemy_hp = int(state.get("enemy_hp", -1))
+        if enemy_hp < 0:
+            self._last_enemy_hp = None
+            self._last_chosen_slot = int(chosen)
+            self._stagnation_count = 0
+            return int(chosen), False
+
+        if self._last_enemy_hp is not None and enemy_hp < self._last_enemy_hp:
+            self._stagnation_count = 0
+        elif (
+            self._last_enemy_hp is not None
+            and enemy_hp == self._last_enemy_hp
+            and self._last_chosen_slot is not None
+            and int(self._last_chosen_slot) == int(chosen)
+        ):
+            self._stagnation_count += 1
+        else:
+            self._stagnation_count = 0
+
+        overrode = False
+        final_slot = int(chosen)
+        if self._stagnation_count >= 2:
+            alternate = self._best_alternate_slot(state, exclude_slot=int(chosen))
+            if alternate is not None and int(alternate) != int(chosen):
+                final_slot = int(alternate)
+                overrode = True
+                self._stagnation_count = 0
+
+        self._last_enemy_hp = enemy_hp
+        self._last_chosen_slot = final_slot
+        return final_slot, overrode
+
     def _state_cache_key(self, state: Dict[str, object]) -> str:
         key = {
             "player_hp": int(state.get("player_hp", 0)),
@@ -217,6 +284,37 @@ class MistralBattleAgent:
         self.illegal_move_attempts += 1
         self.legality_fallback_count += 1
         return self._best_legal_slot(state, legal_slots), True
+
+    def _apply_memory_override(self, state: Dict[str, object], chosen: int) -> tuple[int, bool]:
+        if self.battle_memory is None:
+            return chosen, False
+        return self.battle_memory.maybe_override_slot(state, chosen)
+
+    def start_episode_context(self, state_label: str, state_index: int) -> None:
+        self._episode_state_label = state_label or "unknown_state"
+        self._episode_state_index = int(state_index)
+        self._last_enemy_hp = None
+        self._last_chosen_slot = None
+        self._stagnation_count = 0
+        if self.battle_memory is not None:
+            self.battle_memory.start_episode()
+
+    def record_turn_decision(self, state: Dict[str, object], chosen_slot: int) -> None:
+        if self.battle_memory is None:
+            return
+        enriched = dict(state)
+        enriched.setdefault("state_label", self._episode_state_label)
+        enriched.setdefault("state_index", self._episode_state_index)
+        self.battle_memory.record_turn(enriched, chosen_slot)
+
+    def finalize_episode_memory(self, record: EpisodeRecord) -> None:
+        if self.battle_memory is None:
+            return
+        self.battle_memory.finalize_episode(
+            outcome=record.outcome,
+            reward=record.reward,
+            turns=record.turns,
+        )
 
     def pick_move(
         self,
@@ -246,6 +344,11 @@ class MistralBattleAgent:
                 self.cache_hits += 1
                 chosen = cached
                 tag = "CACHE"
+            elif self.client is None:
+                self.cache_misses += 1
+                chosen = self._heuristic_move(state)
+                tag = "LLM_UNAVAILABLE"
+                self.last_reply = "LLM_UNAVAILABLE: using heuristic fallback."
             else:
                 self.cache_misses += 1
                 self.llm_decision_calls += 1
@@ -255,11 +358,16 @@ class MistralBattleAgent:
                     "Always include line: ACTION: <0-3>\n\n"
                     f"Current strategy:\n{self.strategy}"
                 )
+                memory_hint = ""
+                if self.battle_memory is not None:
+                    memory_hint = self.battle_memory.prompt_hint(state)
                 user_prompt = (
                     "Battle state JSON:\n"
                     f"{json.dumps(state, sort_keys=True)}\n\n"
                     "Return brief reasoning and final ACTION line."
                 )
+                if memory_hint:
+                    user_prompt = f"{user_prompt}\n\n{memory_hint}"
                 try:
                     response = self.client.chat.complete(
                         model=self.model,
@@ -279,16 +387,38 @@ class MistralBattleAgent:
                     chosen = self._heuristic_move(state)
                     self.last_reply = f"LLM_ERROR: {exc}"
                     tag = "HEURISTIC"
-                self.action_cache[cache_key] = chosen
-                chosen, fell_back = self._sanitize_action(chosen, state)
-                if fell_back:
-                    self.last_reply = f"{tag}|LEGALITY_FALLBACK: ACTION: {chosen}"
-                else:
-                    if "LLM\n" not in self.last_reply:
-                        self.last_reply = f"{tag}: ACTION: {chosen}"
-                return chosen
+            chosen, memory_overrode = self._apply_memory_override(state, chosen)
+            if memory_overrode:
+                self.last_reply = (
+                    f"{self.last_reply}\nMEMORY_OVERRIDE: ACTION: {chosen}"
+                    if self.last_reply
+                    else f"{tag}|MEMORY_OVERRIDE: ACTION: {chosen}"
+                )
+            chosen, fell_back = self._sanitize_action(chosen, state)
+            chosen, stagnation_overrode = self._apply_stagnation_override(state, chosen)
+            if stagnation_overrode:
+                self.last_reply = (
+                    f"{self.last_reply}\nSTAGNATION_OVERRIDE: ACTION: {chosen}"
+                    if self.last_reply
+                    else f"{tag}|STAGNATION_OVERRIDE: ACTION: {chosen}"
+                )
+            self.action_cache[cache_key] = chosen
+            if fell_back:
+                self.last_reply = f"{tag}|LEGALITY_FALLBACK: ACTION: {chosen}"
+            else:
+                if "LLM\n" not in self.last_reply:
+                    self.last_reply = f"{tag}: ACTION: {chosen}"
+            return chosen
 
+        chosen, memory_overrode = self._apply_memory_override(state, chosen)
+        if memory_overrode:
+            self.last_reply = f"{tag}|MEMORY_OVERRIDE: ACTION: {chosen}"
+            tag = f"{tag}|MEMORY_OVERRIDE"
         chosen, fell_back = self._sanitize_action(chosen, state)
+        chosen, stagnation_overrode = self._apply_stagnation_override(state, chosen)
+        if stagnation_overrode:
+            self.last_reply = f"{tag}|STAGNATION_OVERRIDE: ACTION: {chosen}"
+            tag = f"{tag}|STAGNATION_OVERRIDE"
         if fell_back:
             self.last_reply = f"{tag}|LEGALITY_FALLBACK: ACTION: {chosen}"
         else:
@@ -339,7 +469,7 @@ class MistralBattleAgent:
     def update_strategy(self, use_llm: bool = True) -> str:
         if not self.history:
             return self.strategy
-        if not use_llm:
+        if not use_llm or self.client is None:
             return self.strategy
 
         recent = self.history[-10:]
@@ -373,6 +503,10 @@ class MistralBattleAgent:
             "Rewrite strategy to maximize win rate and efficiency. "
             "Include explicit guidance to avoid zero-power moves unless no damaging legal move exists."
         )
+        if self.battle_memory is not None:
+            memory_notes = self.battle_memory.reflection_notes(limit=5)
+            if memory_notes:
+                user_prompt = f"{user_prompt}\n\nMemory notes:\n{memory_notes}"
         self.llm_reflection_calls += 1
         try:
             response = self.client.chat.complete(
