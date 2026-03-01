@@ -62,6 +62,3 @@ Quick run commands:
 - PPO evals (Phase 3): `python3 run.py --phase3 --phase3-train-minutes 1 --phase3-eval-episodes 1`
 - Demo (unfinished/experimental): `python3 run.py --phase4-demo`
 
-## Publishing Policy
-- OK to publish: `assets/states/*.state` (starter checkpoints for reproducible runs).
-- Do not publish: `assets/pokemon_red.gb` or ROM-adjacent files (`*.gb`, `*.gb.*`).
