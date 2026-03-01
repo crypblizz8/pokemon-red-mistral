@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -15,6 +16,13 @@ __pycache__/
 # Local game assets (keep directory only)
 assets/*
 !assets/.gitkeep
+!assets/states/
+assets/states/*
+!assets/states/*.state
+assets/states/pokemon_red.gb.state
+assets/states/*.state.bad
+assets/*.gb
+assets/*.gb.*
 
 # Runtime artifacts
 battle_results*.json
@@ -23,7 +31,14 @@ RESULTS*.md
 artifacts/campaign_log.json
 artifacts/memory/
 artifacts/screenshots/
+artifacts/states/
 artifacts/results/*
 !artifacts/results/.gitkeep
 evals/runs/*
 !evals/runs/.gitkeep
+
+# Temporary route planning drafts
+specs/_tmp_*.route.json
+
+# Local experimental file (not part of release path)
+pokemon/route_executor_updated.py

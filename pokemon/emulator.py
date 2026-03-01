@@ -432,19 +432,27 @@ class PokemonEmulator:
             return True
 
         # Battle text boxes and command menus can interleave unpredictably.
-        # This loop advances text and repeatedly re-selects RUN from command menu.
+        # Re-anchor to command menu then explicitly choose RUN (down+right+A).
         total_ticks = max(80, int(timeout_ticks))
-        cycle_budget = max(4, total_ticks // 20)
+        cycle_budget = max(4, total_ticks // 24)
         for _ in range(cycle_budget):
-            for button in ("a", "b", "up", "left", "down", "right", "a"):
+            if not self.in_battle():
+                return True
+            self._normalize_to_command_menu()
+            for button in ("down", "right", "a"):
                 if not self.in_battle():
                     return True
                 self.press(button, frames=2)
                 self._tick(3)
-            for _ in range(20):
+            # Advance post-selection text/turn resolution before retrying.
+            for _ in range(24):
                 if not self.in_battle():
                     return True
                 self._tick(1)
+            # Clear potential text box overlays between retries.
+            if self.in_battle():
+                self.press("b", frames=2)
+                self._tick(2)
         return not self.in_battle()
 
     def stop(self) -> None:

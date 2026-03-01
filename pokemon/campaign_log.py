@@ -17,6 +17,9 @@ def _new_payload() -> Dict[str, object]:
         "totals": {
             "real_battles": 0,
             "simulations": 0,
+            "movement_steps": 0,
+            "phase3_steps": 0,
+            "phase4_steps": 0,
         },
         "entries": [],
     }
@@ -53,6 +56,9 @@ def _load_payload(path: Path) -> Dict[str, object]:
         "totals": {
             "real_battles": _safe_int(totals.get("real_battles")),
             "simulations": _safe_int(totals.get("simulations")),
+            "movement_steps": _safe_int(totals.get("movement_steps")),
+            "phase3_steps": _safe_int(totals.get("phase3_steps")),
+            "phase4_steps": _safe_int(totals.get("phase4_steps")),
         },
         "entries": entries,
     }
@@ -64,6 +70,8 @@ def append_campaign_log_entry(
     kind: str,
     count: int,
     source: str,
+    movement_steps: int = 0,
+    phase: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     if kind not in {"real_battle", "simulation"}:
@@ -74,10 +82,25 @@ def append_campaign_log_entry(
     payload = _load_payload(path)
     totals = payload["totals"]
     if not isinstance(totals, MutableMapping):
-        totals = {"real_battles": 0, "simulations": 0}
+        totals = {
+            "real_battles": 0,
+            "simulations": 0,
+            "movement_steps": 0,
+            "phase3_steps": 0,
+            "phase4_steps": 0,
+        }
 
     counter_key = "real_battles" if kind == "real_battle" else "simulations"
     totals[counter_key] = _safe_int(totals.get(counter_key)) + int(count)
+    normalized_steps = max(0, _safe_int(movement_steps))
+    totals["movement_steps"] = _safe_int(totals.get("movement_steps")) + normalized_steps
+    phase_name = str(phase or "").strip().lower()
+    if not phase_name and isinstance(metadata, Mapping):
+        phase_name = str(metadata.get("phase") or "").strip().lower()
+    if phase_name == "phase3":
+        totals["phase3_steps"] = _safe_int(totals.get("phase3_steps")) + normalized_steps
+    elif phase_name == "phase4":
+        totals["phase4_steps"] = _safe_int(totals.get("phase4_steps")) + normalized_steps
     payload["totals"] = totals
 
     entry: Dict[str, object] = {
@@ -86,6 +109,10 @@ def append_campaign_log_entry(
         "count": int(count),
         "source": source,
     }
+    if normalized_steps > 0:
+        entry["movement_steps"] = normalized_steps
+    if phase_name:
+        entry["phase"] = phase_name
     if metadata:
         entry["metadata"] = dict(metadata)
 
@@ -108,12 +135,18 @@ def campaign_log_report(path: Path) -> Dict[str, object]:
         totals = {}
     real_battles = _safe_int(totals.get("real_battles"))
     simulations = _safe_int(totals.get("simulations"))
+    movement_steps = _safe_int(totals.get("movement_steps"))
+    phase3_steps = _safe_int(totals.get("phase3_steps"))
+    phase4_steps = _safe_int(totals.get("phase4_steps"))
     entries = payload.get("entries")
     return {
         "path": str(path.resolve()),
         "real_battles": real_battles,
         "simulations": simulations,
         "combined": real_battles + simulations,
+        "movement_steps": movement_steps,
+        "phase3_steps": phase3_steps,
+        "phase4_steps": phase4_steps,
         "updated_at": str(payload.get("updated_at") or ""),
         "entries": len(entries) if isinstance(entries, list) else 0,
     }

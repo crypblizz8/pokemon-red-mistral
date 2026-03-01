@@ -6,6 +6,12 @@
 
 > **One-liner:** Build a Pokémon Red battle agent that genuinely learns from experience using Mistral — a self-improving system where the strategy prompt is the policy, battle outcomes are the reward, and Mistral's reflection is the policy update.
 
+> **Legacy note (2026-02-28):** This document preserves the original hackathon draft.
+> Current active phase definitions live in `specs/SPEC-4.md` and `specs/SPEC-5.md`:
+> - Phase 4 = Route executor (`--phase4`)
+> - Phase 5 = Brock-clear executor (`--phase5`)
+> The fine-tuning track below is retained as deferred legacy/stretch content.
+
 ---
 
 ## Table of Contents
@@ -15,7 +21,7 @@
 4. [Phase 1 — Core RL Loop](#phase-1--core-rl-loop-saturday-8-hrs)
 5. [Phase 2 — Richer Battle State](#phase-2--richer-battle-state-saturday-evening-2-hrs)
 6. [Phase 3 — EUREKA Reward Design](#phase-3--eureka-reward-design-sunday-morning-3-hrs)
-7. [Phase 4 — Fine-Tuning Track](#phase-4--fine-tuning-track-sunday-3-hrs-stretch)
+7. [Legacy Phase 4 — Fine-Tuning Track (Deferred)](#legacy-phase-4--fine-tuning-track-deferred-sunday-3-hrs-stretch)
 8. [Weekend Timeline](#8-weekend-timeline)
 9. [Decision Gates](#9-decision-gates)
 10. [Deliverables](#10-deliverables)
@@ -294,7 +300,7 @@ Wrap PyBoy as a Gymnasium environment:
 
 ---
 
-## Phase 4 — Fine-Tuning Track _(Sunday, ~3 hrs, Stretch)_
+## Legacy Phase 4 — Fine-Tuning Track (Deferred) _(Sunday, ~3 hrs, Stretch)_
 
 > 🎯 **Goal:** Fine-tune Ministral 8B on synthetic battle data from Mistral Large 3. Upload adapter to HuggingFace for +20 bonus points.
 

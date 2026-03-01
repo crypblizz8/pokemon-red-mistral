@@ -12,6 +12,9 @@ VALID_DIRECTIONS = {"up", "down", "left", "right"}
 VALID_WAIT_CONDITIONS = {"map_id_is", "not_in_battle", "in_battle"}
 VALID_TARGETS = {"gym_entrance", "brock_badge"}
 VALID_TRAVERSE_MODES = {"wall_follow_ccw"}
+MAP_ID_ALIASES: Dict[int, set[int]] = {
+    51: {37, 38},
+}
 
 
 class RouteValidationError(ValueError):
@@ -72,10 +75,35 @@ def _validate_step(raw: Dict[str, object], idx: int) -> Dict[str, object]:
         if not name:
             raise RouteValidationError(f"route step {idx}: checkpoint.name is required")
         expected_map_id = _int_field(raw, "expected_map_id", min_value=0)
+        raw_allowed_map_ids = raw.get("allowed_map_ids", [])
+        if raw_allowed_map_ids is None:
+            raw_allowed_map_ids = []
+        if not isinstance(raw_allowed_map_ids, list):
+            raise RouteValidationError(
+                f"route step {idx}: checkpoint.allowed_map_ids must be an array of ints"
+            )
+        allowed_map_ids: List[int] = []
+        seen_allowed: set[int] = set()
+        for raw_value in raw_allowed_map_ids:
+            try:
+                map_id = int(raw_value)
+            except Exception as exc:
+                raise RouteValidationError(
+                    f"route step {idx}: checkpoint.allowed_map_ids must be ints"
+                ) from exc
+            if map_id < 0:
+                raise RouteValidationError(
+                    f"route step {idx}: checkpoint.allowed_map_ids must be >= 0"
+                )
+            if map_id == expected_map_id or map_id in seen_allowed:
+                continue
+            seen_allowed.add(map_id)
+            allowed_map_ids.append(map_id)
         return {
             "type": "checkpoint",
             "name": name,
             "expected_map_id": expected_map_id,
+            "allowed_map_ids": allowed_map_ids,
         }
 
     if step_type == "move":
@@ -160,6 +188,7 @@ def _validate_step(raw: Dict[str, object], idx: int) -> Dict[str, object]:
         hold_frames = int(raw.get("hold_frames", 6))
         if hold_frames < 1:
             raise RouteValidationError(f"route step {idx}: hold_frames must be >= 1")
+        transition_preferred = bool(raw.get("transition_preferred", True))
         return {
             "type": "waypoint",
             "map_id": map_id,
@@ -168,6 +197,7 @@ def _validate_step(raw: Dict[str, object], idx: int) -> Dict[str, object]:
             "radius": radius,
             "max_seek_steps": max_seek_steps,
             "hold_frames": hold_frames,
+            "transition_preferred": transition_preferred,
         }
 
     if step_type == "traverse_until_map":
@@ -253,6 +283,7 @@ class _Runtime:
         max_steps: int,
         policy_mode: str,
         target: str,
+        phase4_scope: str,
         wild_run_enabled: bool,
         wild_battle_mode: str,
         farm_hp_threshold: float,
@@ -277,6 +308,8 @@ class _Runtime:
         self.max_steps = max(1, int(max_steps))
         self.policy_mode = str(policy_mode)
         self.target = target
+        raw_scope = str(phase4_scope).strip().lower()
+        self.phase4_scope = raw_scope if raw_scope in {"route_only", "integrated"} else "integrated"
         self.wild_run_enabled = bool(wild_run_enabled)
         self.wild_battle_mode = str(wild_battle_mode).strip().lower() or "run_first"
         if self.wild_battle_mode not in {"run_first", "hp_gated_farm"}:
@@ -310,9 +343,16 @@ class _Runtime:
         self.current_block_start = 0
         self.last_checkpoint_step = -1
         self.current_checkpoint_name = "start"
+        self.current_checkpoint_expected_map_id = -1
+        self.current_checkpoint_allowed_map_ids: List[int] = []
         self.block_retry_used = False
         self.no_progress_steps = 0
         self.last_position: Tuple[int, int, int] | None = None
+        self.last_observed_map_id: int | None = None
+        self.observed_map_transitions: Dict[str, int] = {}
+        self.forest_probe_edges: Dict[str, int] = {}
+        self.forest_probe_phase_counts: Dict[str, int] = {}
+        self.forest_probe_samples: List[Dict[str, object]] = []
         self.rng = random.Random(7)
         self.blocked_edges: set[Tuple[int, int, int, str]] = set()
         self.edge_fail_counts: Dict[Tuple[int, int, int, str], int] = {}
@@ -321,9 +361,69 @@ class _Runtime:
         self.party_constraint_failure_reason = ""
         self.last_party_snapshot: Dict[str, object] = {}
         self.battle_turns_total = 0
+        self.route2_regression_count = 0
+        self._suspend_route2_regression_checks = False
+        self.traverse_attempt_counts: Dict[Tuple[str, int], int] = {}
+        self.forest_script_recovery_count = 0
+        self.forest_script_cycle_count = 0
+        self.forest_script_variant = 0
+        self.route2_lane_fail_counts: Dict[int, int] = {}
+        self.route2_gate_x_fail_counts: Dict[int, int] = {}
+        self.generic_recovery_count = 0
+        self.pewter_waypoint_recovery_count = 0
 
     def _reset_wild_fight_streak(self) -> None:
         self.consecutive_wild_fights = 0
+
+    def _record_map_transition(self, current_map_id: int) -> None:
+        current = int(current_map_id)
+        if self.last_observed_map_id is None:
+            self.last_observed_map_id = current
+            return
+        previous = int(self.last_observed_map_id)
+        if previous != current:
+            edge = f"{previous}->{current}"
+            self.observed_map_transitions[edge] = int(self.observed_map_transitions.get(edge, 0)) + 1
+        self.last_observed_map_id = current
+
+    def _record_forest_probe_action(
+        self,
+        *,
+        button: str,
+        phase: str,
+        before: Tuple[int, int, int],
+        after: Tuple[int, int, int],
+    ) -> None:
+        if not (
+            self.phase4_scope == "route_only"
+            and str(self.current_checkpoint_name)
+            in {"Forest_To_Pewter", "Forest_Exit_Gate", "Viridian_Forest_Upper"}
+        ):
+            return
+        phase_name = str(phase).strip() or "unknown"
+        from_map = int(before[0])
+        to_map = int(after[0])
+        if phase_name == "unknown" and from_map == to_map:
+            return
+        self.forest_probe_phase_counts[phase_name] = int(
+            self.forest_probe_phase_counts.get(phase_name, 0)
+        ) + 1
+        edge_key = f"{from_map}->{to_map}"
+        self.forest_probe_edges[edge_key] = int(self.forest_probe_edges.get(edge_key, 0)) + 1
+        if len(self.forest_probe_samples) >= 240:
+            return
+        self.forest_probe_samples.append(
+            {
+                "phase": phase_name,
+                "button": str(button),
+                "from_map": from_map,
+                "from_x": int(before[1]),
+                "from_y": int(before[2]),
+                "to_map": to_map,
+                "to_x": int(after[1]),
+                "to_y": int(after[2]),
+            }
+        )
 
     def _nav_state(self) -> Dict[str, int]:
         raw = self.emu.get_nav_state()
@@ -343,6 +443,18 @@ class _Runtime:
         self.blocked_edges.clear()
         self.edge_fail_counts.clear()
         self.recent_positions.clear()
+
+    def _rotate_int_sequence(self, values: List[int], offset: int) -> List[int]:
+        if not values:
+            return []
+        size = len(values)
+        shift = int(offset) % size
+        if shift == 0:
+            return list(values)
+        return list(values[shift:]) + list(values[:shift])
+
+    def _bump_forest_variant(self, step: int = 1) -> None:
+        self.forest_script_variant = (int(self.forest_script_variant) + max(1, int(step))) % 32
 
     def _edge_key(self, pos: Tuple[int, int, int], action: str) -> Tuple[int, int, int, str]:
         map_id, x, y = pos
@@ -385,13 +497,42 @@ class _Runtime:
 
         gym_cfg = self.targets.get("gym_entrance", {"map_id": 2})
         nav = self._nav_state()
-        if int(nav.get("map_id", -1)) != int(gym_cfg.get("map_id", 2)):
+        if not self._map_matches(
+            int(nav.get("map_id", -1)),
+            int(gym_cfg.get("map_id", 2)),
+        ):
             return False
         if "x" in gym_cfg and int(nav.get("x", -1)) != int(gym_cfg["x"]):
             return False
         if "y" in gym_cfg and int(nav.get("y", -1)) != int(gym_cfg["y"]):
             return False
         return True
+
+    def _map_matches(self, actual_map_id: int, expected_map_id: int) -> bool:
+        actual = int(actual_map_id)
+        expected = int(expected_map_id)
+        if actual == expected:
+            return True
+        aliases = MAP_ID_ALIASES.get(expected, set())
+        return actual in aliases
+
+    def _canonical_route2_map_id(self, map_id: int) -> int:
+        value = int(map_id)
+        if value in {37, 38}:
+            return 51
+        if value == 47:
+            return 50
+        return value
+
+    def _is_route2_progress_checkpoint(self, checkpoint_name: str) -> bool:
+        return str(checkpoint_name) in {
+            "Route2",
+            "Route2_GateHouse",
+            "Viridian_Forest",
+            "Forest_To_Pewter",
+            "Forest_Exit_Gate",
+            "Forest_Exit",
+        }
 
     def _emit(self, event: str, **payload: object) -> None:
         nav = self._nav_state()
@@ -405,6 +546,16 @@ class _Runtime:
         }
         base.update(payload)
         self.timeline.emit(event, base)
+
+    def _checkpoint_map_allowed(self, map_id: int) -> bool:
+        current_map = int(map_id)
+        expected = int(self.current_checkpoint_expected_map_id)
+        if expected >= 0 and self._map_matches(current_map, expected):
+            return True
+        for allowed_map_id in self.current_checkpoint_allowed_map_ids:
+            if self._map_matches(current_map, int(allowed_map_id)):
+                return True
+        return False
 
     def _party_constraint_status(self) -> Dict[str, object]:
         if not self.enforce_party_constraint:
@@ -510,21 +661,46 @@ class _Runtime:
         )
         raise RouteExecutionError("party_constraint_failed")
 
-    def _mark_checkpoint_reached(self, *, step_index: int, checkpoint_name: str, expected_map_id: int) -> None:
+    def _mark_checkpoint_reached(
+        self,
+        *,
+        step_index: int,
+        checkpoint_name: str,
+        expected_map_id: int,
+        allowed_map_ids: List[int] | None = None,
+    ) -> None:
         self.checkpoints_reached += 1
         self.current_checkpoint_name = str(checkpoint_name)
+        self.current_checkpoint_expected_map_id = int(expected_map_id)
+        self.current_checkpoint_allowed_map_ids = [int(v) for v in (allowed_map_ids or [])]
         self.last_checkpoint_step = step_index
         self.current_block_start = step_index + 1
         self.block_retry_used = False
+        self.generic_recovery_count = 0
+        self.pewter_waypoint_recovery_count = 0
         self.no_progress_steps = 0
         self._reset_wild_fight_streak()
         self.last_position = self._position_key()
         self._reset_nav_memory()
+        if self.current_checkpoint_name not in {
+            "Forest_To_Pewter",
+            "Forest_Exit_Gate",
+            "Forest_Exit",
+            "Viridian_Forest_Upper",
+        }:
+            self.forest_script_recovery_count = 0
+            self.forest_script_cycle_count = 0
+            self.forest_script_variant = 0
+            self.route2_lane_fail_counts.clear()
+            self.route2_gate_x_fail_counts.clear()
+        if not self._is_route2_progress_checkpoint(self.current_checkpoint_name):
+            self.route2_regression_count = 0
         self._emit(
             "checkpoint_reached",
             route_step_index=step_index,
             checkpoint_name=self.current_checkpoint_name,
             expected_map_id=expected_map_id,
+            allowed_map_ids=self.current_checkpoint_allowed_map_ids,
         )
 
     def _consume_step(self, amount: int = 1) -> None:
@@ -591,6 +767,105 @@ class _Runtime:
                 self._handle_battle_interrupt(step_index=-1)
 
     def _trigger_recovery(self, *, reason: str, step_index: int, **extra: object) -> int:
+        if (
+            str(reason) == "forest_to_pewter_script_failed"
+            and str(self.current_checkpoint_name) in {"Forest_To_Pewter", "Forest_Exit_Gate", "Forest_Exit"}
+        ):
+            self.recovery_events += 1
+            self.forest_script_recovery_count += 1
+            attempt = int(self.forest_script_recovery_count)
+            max_attempts = 8
+            self._emit(
+                "recovery_triggered",
+                reason=reason,
+                route_step_index=step_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                **extra,
+            )
+            self._execute_recovery_actions(step_index)
+            if attempt >= max_attempts:
+                raise RouteExecutionError("recovery_exhausted")
+            self.block_retry_used = False
+            self.no_progress_steps = 0
+            self.generic_recovery_count = 0
+            self._reset_wild_fight_streak()
+            self.last_position = self._position_key()
+            self._reset_nav_memory()
+            self._bump_forest_variant(step=3)
+            self.forest_script_cycle_count = 0
+            return self.current_block_start
+
+        if (
+            str(reason) == "forest_to_pewter_script_cycle_limit"
+            and str(self.current_checkpoint_name) in {"Forest_To_Pewter", "Forest_Exit_Gate", "Forest_Exit"}
+        ):
+            self._bump_forest_variant(step=2)
+
+        if (
+            self.phase4_scope == "route_only"
+            and str(self.current_checkpoint_name) == "Pewter_City"
+            and str(reason) in {"waypoint_stuck", "waypoint_timeout", "waypoint_map_lost"}
+        ):
+            self.recovery_events += 1
+            self.pewter_waypoint_recovery_count += 1
+            attempt = int(self.pewter_waypoint_recovery_count)
+            max_attempts = 10
+            self._emit(
+                "recovery_triggered",
+                reason=reason,
+                route_step_index=step_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                **extra,
+            )
+            self._execute_recovery_actions(step_index)
+            if attempt >= max_attempts:
+                raise RouteExecutionError("recovery_exhausted")
+            self.block_retry_used = True
+            self.no_progress_steps = 0
+            self._reset_wild_fight_streak()
+            self.last_position = self._position_key()
+            self._reset_nav_memory()
+            return self.current_block_start
+
+        extended_recovery = (
+            self.phase4_scope == "integrated"
+            and str(self.current_checkpoint_name)
+            in {"Route2", "Route2_GateHouse", "Viridian_Forest", "Forest_To_Pewter", "Forest_Exit_Gate"}
+            and str(reason)
+            in {
+                "traverse_timeout",
+                "waypoint_map_mismatch",
+                "waypoint_map_lost",
+                "traverse_loop_stuck",
+                "traverse_gatehouse_map_lost",
+            }
+        )
+        if extended_recovery:
+            self.recovery_events += 1
+            self.generic_recovery_count += 1
+            attempt = int(self.generic_recovery_count)
+            max_attempts = 4
+            self._emit(
+                "recovery_triggered",
+                reason=reason,
+                route_step_index=step_index,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                **extra,
+            )
+            self._execute_recovery_actions(step_index)
+            if attempt >= max_attempts:
+                raise RouteExecutionError("recovery_exhausted")
+            self.block_retry_used = True
+            self.no_progress_steps = 0
+            self._reset_wild_fight_streak()
+            self.last_position = self._position_key()
+            self._reset_nav_memory()
+            self.forest_script_cycle_count = 0
+            return self.current_block_start
+
         self.recovery_events += 1
         attempt = 2 if self.block_retry_used else 1
         self._emit(
@@ -608,13 +883,112 @@ class _Runtime:
         self._reset_wild_fight_streak()
         self.last_position = self._position_key()
         self._reset_nav_memory()
+        self.forest_script_cycle_count = 0
+        return self.current_block_start
+
+    def _handle_route2_map_regression(self, *, step_index: int, map_id: int) -> int | None:
+        if self._suspend_route2_regression_checks:
+            return None
+        if self.phase4_scope != "route_only":
+            return None
+        if not self._is_route2_progress_checkpoint(self.current_checkpoint_name):
+            return None
+        canonical_current = self._canonical_route2_map_id(int(map_id))
+        canonical_expected = self._canonical_route2_map_id(int(self.current_checkpoint_expected_map_id))
+        if self._map_matches(canonical_current, canonical_expected):
+            return None
+        next_map_id = self._next_checkpoint_expected_map_id(step_index)
+        canonical_next = (
+            self._canonical_route2_map_id(int(next_map_id))
+            if next_map_id is not None
+            else None
+        )
+        if canonical_next is not None and self._map_matches(canonical_current, canonical_next):
+            return None
+
+        progression = [13, 50, 51, 2]
+        expected_idx = progression.index(canonical_expected) if canonical_expected in progression else -1
+        current_idx = progression.index(canonical_current) if canonical_current in progression else -1
+        if current_idx > expected_idx >= 0:
+            return None
+        if current_idx == -1 and int(map_id) not in {0, 1, 12, 44}:
+            return None
+
+        if (
+            self.current_checkpoint_name == "Viridian_Forest"
+            and canonical_expected == 51
+            and canonical_current in {50, 13}
+        ):
+            reentered = self._seek_expected_map(
+                expected_map_id=51,
+                step_index=step_index,
+                max_seek_steps=420,
+                suppress_regression=True,
+            )
+            if reentered:
+                self.route2_regression_count = 0
+                self.no_progress_steps = 0
+                self.last_position = self._position_key()
+                self._reset_nav_memory()
+                self._emit(
+                    "route2_forest_reentry",
+                    route_step_index=step_index,
+                    reentry_from_map_id=int(map_id),
+                )
+                return self.current_block_start
+
+        if (
+            self.current_checkpoint_name in {"Forest_To_Pewter", "Forest_Exit_Gate", "Forest_Exit"}
+            and canonical_expected == 51
+            and canonical_current in {50, 13}
+        ):
+            return None
+
+        self.route2_regression_count += 1
+        if self.route2_regression_count >= 2:
+            self._emit(
+                "recovery_triggered",
+                reason="route2_map_regression_exhausted",
+                route_step_index=step_index,
+                attempt=int(self.route2_regression_count),
+                regressed_map_id=int(map_id),
+                regressed_map_id_canonical=int(canonical_current),
+                checkpoint_expected_map_id=int(canonical_expected),
+                checkpoint_next_map_id=int(canonical_next if canonical_next is not None else -1),
+            )
+            raise RouteExecutionError("route2_map_regression_exhausted")
+
+        self.recovery_events += 1
+        self._emit(
+            "recovery_triggered",
+            reason="route2_map_regression",
+            route_step_index=step_index,
+            attempt=int(self.route2_regression_count),
+            regressed_map_id=int(map_id),
+            regressed_map_id_canonical=int(canonical_current),
+            checkpoint_expected_map_id=int(canonical_expected),
+            checkpoint_next_map_id=int(canonical_next if canonical_next is not None else -1),
+        )
+        self._execute_recovery_actions(step_index)
+        self.no_progress_steps = 0
+        self._reset_wild_fight_streak()
+        self.last_position = self._position_key()
+        self._reset_nav_memory()
         return self.current_block_start
 
     def _after_world_progress(self, *, step_index: int, suppress_no_progress: bool = False) -> int | None:
         nav = self._nav_state()
+        self._record_map_transition(int(nav.get("map_id", 0)))
         if int(nav.get("in_battle", 0)) != 0:
             self.no_progress_steps = 0
             return self._handle_battle_interrupt(step_index=step_index)
+
+        redirect = self._handle_route2_map_regression(
+            step_index=step_index,
+            map_id=int(nav.get("map_id", 0)),
+        )
+        if redirect is not None:
+            return redirect
 
         pos = (int(nav["map_id"]), int(nav["x"]), int(nav["y"]))
         if self.last_position is None or pos != self.last_position:
@@ -674,7 +1048,7 @@ class _Runtime:
 
         return (not self.emu.in_battle(), int(turn))
 
-    def _handle_battle_interrupt(self, *, step_index: int) -> int:
+    def _handle_battle_interrupt(self, *, step_index: int) -> int | None:
         self._validate_party_constraint(stage="battle_enter", step_index=step_index)
         kind = self._battle_kind()
         self.battles_fought += 1
@@ -688,24 +1062,50 @@ class _Runtime:
         if kind == "wild":
             run_decision = self._wild_battle_decision(step_index=step_index)
 
+        if kind == "wild" and self.phase4_scope == "route_only":
+            max_attempts = 3
+            for _ in range(max_attempts):
+                self.wild_run_attempts += 1
+                self._emit(
+                    "wild_run_attempt",
+                    route_step_index=step_index,
+                    attempt=self.wild_run_attempts,
+                )
+                run_success = False
+                if hasattr(self.emu, "attempt_run"):
+                    run_success = bool(self.emu.attempt_run(timeout_ticks=320))
+                if run_success and not self.emu.in_battle():
+                    self.wild_run_successes += 1
+                    self._emit("battle_exit", battle_kind=kind, result="run_success")
+                    self._validate_party_constraint(stage="battle_exit", step_index=step_index)
+                    self.no_progress_steps = 0
+                    self._reset_wild_fight_streak()
+                    self.last_position = self._position_key()
+                    return None
+            raise RouteExecutionError("wild_run_blocked_route_only")
+
         if kind == "wild" and self.wild_run_enabled and run_decision == "run":
-            self.wild_run_attempts += 1
-            self._emit(
-                "wild_run_attempt",
-                route_step_index=step_index,
-                attempt=self.wild_run_attempts,
-            )
-            run_success = False
-            if hasattr(self.emu, "attempt_run"):
-                run_success = bool(self.emu.attempt_run(timeout_ticks=320))
-            if run_success and not self.emu.in_battle():
-                self.wild_run_successes += 1
-                self._emit("battle_exit", battle_kind=kind, result="run_success")
-                self._validate_party_constraint(stage="battle_exit", step_index=step_index)
-                self.no_progress_steps = 0
-                self._reset_wild_fight_streak()
-                self.last_position = self._position_key()
-                return self.current_block_start
+            max_attempts = 3
+            for _ in range(max_attempts):
+                self.wild_run_attempts += 1
+                self._emit(
+                    "wild_run_attempt",
+                    route_step_index=step_index,
+                    attempt=self.wild_run_attempts,
+                )
+                run_success = False
+                if hasattr(self.emu, "attempt_run"):
+                    run_success = bool(self.emu.attempt_run(timeout_ticks=320))
+                if run_success and not self.emu.in_battle():
+                    self.wild_run_successes += 1
+                    self._emit("battle_exit", battle_kind=kind, result="run_success")
+                    self._validate_party_constraint(stage="battle_exit", step_index=step_index)
+                    self.no_progress_steps = 0
+                    self._reset_wild_fight_streak()
+                    self.last_position = self._position_key()
+                    if self.phase4_scope == "route_only":
+                        return None
+                    return self.current_block_start
 
         battle_resolved, battle_turns = self._run_battle_agent()
         self.battle_turns_total += int(battle_turns)
@@ -723,114 +1123,175 @@ class _Runtime:
             self.consecutive_wild_fights += 1
         self.no_progress_steps = 0
         self.last_position = self._position_key()
+        if self.phase4_scope == "route_only":
+            return None
         return self.current_block_start
 
-    def _seek_expected_map(self, *, expected_map_id: int, step_index: int, max_seek_steps: int = 5000) -> bool:
+    def _seek_expected_map(
+        self,
+        *,
+        expected_map_id: int,
+        step_index: int,
+        max_seek_steps: int = 5000,
+        suppress_regression: bool = False,
+    ) -> bool:
         transition_hint = {
             (12, 1): "up",
             (1, 12): "down",
             (1, 13): "up",
+            (12, 13): "up",
             (13, 1): "down",
+            (13, 50): "up",
+            (50, 13): "down",
+            (13, 47): "down",
+            (47, 13): "up",
+            (47, 50): "up",
+            (50, 47): "down",
+            (47, 51): "down",
+            (51, 47): "up",
+            (13, 0): "up",
+            (0, 13): "down",
             (13, 2): "up",
+            (47, 2): "up",
             (2, 13): "down",
+            (2, 47): "down",
             (50, 2): "up",
             (2, 50): "down",
+            (50, 51): "up",
+            (51, 50): "down",
+            (0, 51): "up",
+            (51, 0): "down",
+            (51, 2): "up",
+            (38, 2): "up",
+            (0, 2): "up",
+            (37, 2): "up",
         }
         action_tries: Dict[Tuple[int, int, int, str], int] = {}
         pos_visits: Dict[Tuple[int, int, int], int] = {}
         unique_positions: set[Tuple[int, int, int]] = set()
-        for i in range(max_seek_steps):
-            nav = self._nav_state()
-            curr_map_id = int(nav.get("map_id", 0))
-            if curr_map_id == expected_map_id:
-                return True
+        last_unique_count = 0
+        last_unique_step = 0
+        prev_suspend_regression = bool(self._suspend_route2_regression_checks)
+        if suppress_regression:
+            self._suspend_route2_regression_checks = True
+        try:
+            for i in range(max_seek_steps):
+                nav = self._nav_state()
+                curr_map_id = int(nav.get("map_id", 0))
+                if self._map_matches(curr_map_id, expected_map_id):
+                    return True
 
-            preferred = transition_hint.get((curr_map_id, expected_map_id), "up")
-            pos = self._position_key()
-            pos_visits[pos] = int(pos_visits.get(pos, 0)) + 1
-            unique_positions.add(pos)
+                preferred = transition_hint.get((curr_map_id, expected_map_id), "up")
+                pos = self._position_key()
+                pos_visits[pos] = int(pos_visits.get(pos, 0)) + 1
+                unique_positions.add(pos)
+                if len(unique_positions) > last_unique_count:
+                    last_unique_count = len(unique_positions)
+                    last_unique_step = i
+                elif i > 0 and (i - last_unique_step) >= 192:
+                    self.blocked_edges.clear()
+                    self.edge_fail_counts.clear()
+                    last_unique_step = i
+                    self._emit(
+                        "seek_unstuck_reset",
+                        route_step_index=step_index,
+                        expected_map_id=expected_map_id,
+                        seek_steps=i,
+                        seek_unique_positions=len(unique_positions),
+                        seek_current_map_id=curr_map_id,
+                    )
+                    redirect = self._press_button(
+                        "b",
+                        hold_frames=2,
+                        step_index=step_index,
+                        suppress_no_progress=True,
+                    )
+                    if redirect is not None:
+                        continue
 
-            if i > 0 and i % 256 == 0:
-                self._emit(
-                    "seek_progress",
-                    route_step_index=step_index,
-                    expected_map_id=expected_map_id,
-                    seek_steps=i,
-                    seek_unique_positions=len(unique_positions),
-                    seek_current_map_id=curr_map_id,
-                )
-            sweep_dir = None
-            if preferred == "up" and int(pos[2]) <= 2:
-                sweep_dir = "right" if ((i // 18) % 2 == 0) else "left"
-            elif preferred == "down" and int(pos[2]) >= 253:
-                sweep_dir = "right" if ((i // 18) % 2 == 0) else "left"
-            elif preferred == "left" and int(pos[1]) <= 2:
-                sweep_dir = "up" if ((i // 18) % 2 == 0) else "down"
-            elif preferred == "right" and int(pos[1]) >= 253:
-                sweep_dir = "up" if ((i // 18) % 2 == 0) else "down"
+                if i > 0 and i % 256 == 0:
+                    self._emit(
+                        "seek_progress",
+                        route_step_index=step_index,
+                        expected_map_id=expected_map_id,
+                        seek_steps=i,
+                        seek_unique_positions=len(unique_positions),
+                        seek_current_map_id=curr_map_id,
+                    )
+                sweep_dir = None
+                if preferred == "up" and int(pos[2]) <= 2:
+                    sweep_dir = "right" if ((i // 18) % 2 == 0) else "left"
+                elif preferred == "down" and int(pos[2]) >= 253:
+                    sweep_dir = "right" if ((i // 18) % 2 == 0) else "left"
+                elif preferred == "left" and int(pos[1]) <= 2:
+                    sweep_dir = "up" if ((i // 18) % 2 == 0) else "down"
+                elif preferred == "right" and int(pos[1]) >= 253:
+                    sweep_dir = "up" if ((i // 18) % 2 == 0) else "down"
 
-            if i % 41 == 0:
-                action = "b"
-            else:
-                orth_1, orth_2 = self._orthogonal_directions(preferred, i)
-                opposite = self._opposite_direction(preferred)
-                candidates: List[str] = []
-                if sweep_dir is not None:
-                    candidates.extend([preferred, sweep_dir, orth_1, orth_2, opposite])
+                if i % 41 == 0:
+                    action = "b"
                 else:
-                    candidates.extend([preferred, orth_1, orth_2, opposite])
+                    orth_1, orth_2 = self._orthogonal_directions(preferred, i)
+                    opposite = self._opposite_direction(preferred)
+                    candidates: List[str] = []
+                    if sweep_dir is not None:
+                        candidates.extend([preferred, sweep_dir, orth_1, orth_2, opposite])
+                    else:
+                        candidates.extend([preferred, orth_1, orth_2, opposite])
 
-                action = preferred
-                best_score: Tuple[float, float] | None = None
-                for candidate in candidates:
-                    if not self._is_edge_blocked(pos, candidate):
-                        edge = self._edge_key(pos, candidate)
-                        tries = float(action_tries.get(edge, 0))
-                        # Lower score is better: prefer less-tried edges while biasing toward hinted direction.
-                        bias = 0.0
-                        if candidate == preferred:
-                            bias -= 0.35
-                        elif candidate == opposite:
-                            bias += 0.9
-                        else:
-                            bias += 0.25
-                        if sweep_dir is not None and candidate == sweep_dir:
-                            bias -= 0.15
-                        if pos_visits[pos] > 8 and candidate == opposite:
-                            bias += 0.6
-                        score = (tries + bias, self.rng.random())
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            action = candidate
-                if best_score is None:
                     action = preferred
+                    best_score: Tuple[float, float] | None = None
+                    for candidate in candidates:
+                        if not self._is_edge_blocked(pos, candidate):
+                            edge = self._edge_key(pos, candidate)
+                            tries = float(action_tries.get(edge, 0))
+                            # Lower score is better: prefer less-tried edges while biasing toward hinted direction.
+                            bias = 0.0
+                            if candidate == preferred:
+                                bias -= 0.35
+                            elif candidate == opposite:
+                                bias += 0.9
+                            else:
+                                bias += 0.25
+                            if sweep_dir is not None and candidate == sweep_dir:
+                                bias -= 0.15
+                            if pos_visits[pos] > 8 and candidate == opposite:
+                                bias += 0.6
+                            score = (tries + bias, self.rng.random())
+                            if best_score is None or score < best_score:
+                                best_score = score
+                                action = candidate
+                    if best_score is None:
+                        action = preferred
 
-            if action != "b":
-                edge = self._edge_key(pos, action)
-                action_tries[edge] = int(action_tries.get(edge, 0)) + 1
+                if action != "b":
+                    edge = self._edge_key(pos, action)
+                    action_tries[edge] = int(action_tries.get(edge, 0)) + 1
 
-            hold_frames = 2 if action == "b" else 6
-            if action == "b":
-                redirect = self._press_button(
-                    action,
-                    hold_frames=hold_frames,
-                    step_index=step_index,
-                    suppress_no_progress=True,
-                )
-                if redirect is not None:
-                    continue
-            else:
-                redirect, moved, _, _ = self._attempt_nav_action(
-                    action=action,
-                    hold_frames=hold_frames,
-                    step_index=step_index,
-                )
-                if redirect is not None:
-                    continue
-                if not moved and pos_visits[pos] >= 6:
-                    # If repeatedly stuck on this tile, lower opposite-edge penalty next rounds.
-                    opposite_edge = self._edge_key(pos, self._opposite_direction(preferred))
-                    action_tries[opposite_edge] = max(0, int(action_tries.get(opposite_edge, 0)) - 1)
+                hold_frames = 2 if action == "b" else 6
+                if action == "b":
+                    redirect = self._press_button(
+                        action,
+                        hold_frames=hold_frames,
+                        step_index=step_index,
+                        suppress_no_progress=True,
+                    )
+                    if redirect is not None:
+                        continue
+                else:
+                    redirect, moved, _, _ = self._attempt_nav_action(
+                        action=action,
+                        hold_frames=hold_frames,
+                        step_index=step_index,
+                    )
+                    if redirect is not None:
+                        continue
+                    if not moved and pos_visits[pos] >= 6:
+                        # If repeatedly stuck on this tile, lower opposite-edge penalty next rounds.
+                        opposite_edge = self._edge_key(pos, self._opposite_direction(preferred))
+                        action_tries[opposite_edge] = max(0, int(action_tries.get(opposite_edge, 0)) - 1)
+        finally:
+            self._suspend_route2_regression_checks = prev_suspend_regression
         self._emit(
             "seek_failed",
             route_step_index=step_index,
@@ -839,7 +1300,7 @@ class _Runtime:
             seek_unique_positions=len(unique_positions),
             seek_current_map_id=int(self._nav_state().get("map_id", -1)),
         )
-        return int(self._nav_state().get("map_id", -1)) == int(expected_map_id)
+        return self._map_matches(int(self._nav_state().get("map_id", -1)), int(expected_map_id))
 
     def _press_button(
         self,
@@ -848,9 +1309,23 @@ class _Runtime:
         step_index: int,
         *,
         suppress_no_progress: bool = False,
+        forest_phase: str = "",
     ) -> int | None:
+        before = self._position_key()
         self.emu.press(button, frames=max(1, int(hold_frames)))
         self._consume_step(1)
+        after_nav = self._nav_state()
+        after = (
+            int(after_nav.get("map_id", 0)),
+            int(after_nav.get("x", 0)),
+            int(after_nav.get("y", 0)),
+        )
+        self._record_forest_probe_action(
+            button=button,
+            phase=str(forest_phase),
+            before=before,
+            after=after,
+        )
         return self._after_world_progress(
             step_index=step_index,
             suppress_no_progress=suppress_no_progress,
@@ -1120,9 +1595,11 @@ class _Runtime:
         radius = max(0, int(step["radius"]))
         max_seek_steps = max(1, int(step["max_seek_steps"]))
         hold_frames = max(1, int(step["hold_frames"]))
+        transition_preferred = bool(step.get("transition_preferred", True))
+        next_checkpoint_map_id = self._next_checkpoint_expected_map_id(step_index)
 
         nav = self._nav_state()
-        if int(nav.get("map_id", -1)) != target_map_id:
+        if not self._map_matches(int(nav.get("map_id", -1)), target_map_id):
             if not self._seek_expected_map(
                 expected_map_id=target_map_id,
                 step_index=step_index,
@@ -1136,10 +1613,18 @@ class _Runtime:
 
         action_tries: Dict[Tuple[int, int, int, str], int] = {}
         stagnant = 0
+        best_distance = 1_000_000
+        stagnant_without_improvement = 0
         for i in range(max_seek_steps):
             nav = self._nav_state()
             curr_map_id = int(nav.get("map_id", 0))
-            if curr_map_id != target_map_id:
+            if (
+                next_checkpoint_map_id is not None
+                and not self._map_matches(int(next_checkpoint_map_id), int(target_map_id))
+                and self._map_matches(curr_map_id, int(next_checkpoint_map_id))
+            ):
+                return None
+            if not self._map_matches(curr_map_id, target_map_id):
                 remaining = max(64, max_seek_steps - i)
                 if self._seek_expected_map(
                     expected_map_id=target_map_id,
@@ -1155,8 +1640,54 @@ class _Runtime:
 
             x_now = int(nav.get("x", 0))
             y_now = int(nav.get("y", 0))
-            if abs(target_x - x_now) + abs(target_y - y_now) <= radius:
+            distance = abs(target_x - x_now) + abs(target_y - y_now)
+            if distance <= radius:
                 return None
+            if distance < best_distance:
+                best_distance = int(distance)
+                stagnant_without_improvement = 0
+            else:
+                stagnant_without_improvement += 1
+
+            if (
+                transition_preferred
+                and
+                next_checkpoint_map_id is not None
+                and not self._map_matches(int(next_checkpoint_map_id), int(target_map_id))
+                and stagnant_without_improvement >= 72
+            ):
+                remaining = max(96, max_seek_steps - i)
+                if self._seek_expected_map(
+                    expected_map_id=int(next_checkpoint_map_id),
+                    step_index=step_index,
+                    max_seek_steps=remaining,
+                ):
+                    return None
+                stagnant_without_improvement = 0
+
+            if (
+                transition_preferred
+                and
+                self.phase4_scope == "route_only"
+                and next_checkpoint_map_id is not None
+                and not self._map_matches(int(next_checkpoint_map_id), int(target_map_id))
+                and i > 0
+                and (i % 96 == 0 or stagnant_without_improvement >= 24)
+            ):
+                remaining = max(96, max_seek_steps - i)
+                if self._seek_expected_map(
+                    expected_map_id=int(next_checkpoint_map_id),
+                    step_index=step_index,
+                    max_seek_steps=min(420, remaining),
+                ):
+                    self._emit(
+                        "waypoint_transition_preferred",
+                        route_step_index=step_index,
+                        waypoint_map_id=target_map_id,
+                        next_checkpoint_map_id=int(next_checkpoint_map_id),
+                        waypoint_seek_steps=i,
+                    )
+                    return None
 
             pos = (curr_map_id, x_now, y_now)
             candidates = self._direction_priority_to_target(
@@ -1230,6 +1761,576 @@ class _Runtime:
             self._opposite_direction(heading),
         ]
 
+    def _run_forest_to_pewter_script(
+        self,
+        *,
+        step_index: int,
+        hold_frames: int,
+        target_map_id: int,
+        traverse_attempt: int,
+    ) -> tuple[bool, int | None]:
+        if not (
+            self.phase4_scope == "route_only"
+            and int(target_map_id) == 2
+            and str(self.current_checkpoint_name) in {"Forest_To_Pewter", "Forest_Exit_Gate"}
+        ):
+            return False, None
+
+        self.forest_script_cycle_count += 1
+        if self.forest_script_cycle_count > 10:
+            return True, self._trigger_recovery(
+                reason="forest_to_pewter_script_cycle_limit",
+                step_index=step_index,
+                target_map_id=target_map_id,
+                cycle_count=int(self.forest_script_cycle_count),
+            )
+
+        nav = self._nav_state()
+        curr_map_id = int(nav.get("map_id", 0))
+        y_now = int(nav.get("y", 0))
+
+        if curr_map_id not in {13, 47, 50, 51}:
+            return False, None
+
+        def _script_press(button: str, phase: str) -> tuple[int | None, bool, bool]:
+            before = self._position_key()
+            redirect = self._press_button(
+                button,
+                hold_frames=hold_frames,
+                step_index=step_index,
+                suppress_no_progress=True,
+                forest_phase=phase,
+            )
+            if redirect is not None:
+                return redirect, False, False
+            after = self._position_key()
+            moved = after != before
+            reached = self._map_matches(int(after[0]), target_map_id)
+            return None, moved, reached
+
+        any_progress = False
+        variant_seed = (
+            int(self.forest_script_variant)
+            + int(traverse_attempt)
+            + int(self.forest_script_cycle_count)
+        ) % 32
+
+        if curr_map_id == 51:
+            self._emit(
+                "forest_to_pewter_script_forest_south_exit",
+                route_step_index=step_index,
+                target_map_id=target_map_id,
+                traverse_attempt=traverse_attempt,
+                traverse_current_map_id=curr_map_id,
+                traverse_current_y=y_now,
+                forest_variant=variant_seed,
+            )
+            progressed = False
+            forest_budget = 320
+
+            # Phase-rotated pre-probe before committing to the legacy south-exit routine.
+            if (variant_seed % 3) != 0:
+                north_lanes = self._rotate_int_sequence(
+                    [12, 13, 14, 15, 16, 17, 11, 18, 10, 19],
+                    offset=variant_seed,
+                )
+                for align_x in north_lanes:
+                    for _ in range(8):
+                        if forest_budget <= 0:
+                            break
+                        nav_now = self._nav_state()
+                        if int(nav_now.get("map_id", 0)) != 51:
+                            break
+                        x_now = int(nav_now.get("x", 0))
+                        if x_now == int(align_x):
+                            break
+                        forest_budget -= 1
+                        button = "right" if x_now < int(align_x) else "left"
+                        redirect, moved, reached = _script_press(button, "forest_north_align")
+                        if redirect is not None:
+                            return True, redirect
+                        if reached:
+                            return True, None
+                        if moved:
+                            progressed = True
+                            any_progress = True
+
+                    stagnant = 0
+                    probe_budget = 24 + (variant_seed % 5)
+                    for _ in range(probe_budget):
+                        if forest_budget <= 0:
+                            break
+                        nav_now = self._nav_state()
+                        if int(nav_now.get("map_id", 0)) != 51:
+                            break
+                        forest_budget -= 1
+                        redirect, moved, reached = _script_press("up", "forest_north_probe")
+                        if redirect is not None:
+                            return True, redirect
+                        if reached:
+                            return True, None
+                        if moved:
+                            progressed = True
+                            any_progress = True
+                            stagnant = 0
+                        else:
+                            stagnant += 1
+                        if stagnant >= 8:
+                            break
+                    if int(self._nav_state().get("map_id", 0)) != 51 or forest_budget <= 0:
+                        break
+                if int(self._nav_state().get("map_id", 0)) != 51:
+                    nav = self._nav_state()
+                    curr_map_id = int(nav.get("map_id", 0))
+                    y_now = int(nav.get("y", 0))
+
+            for _ in range(36):
+                if forest_budget <= 0:
+                    break
+                nav_now = self._nav_state()
+                if int(nav_now.get("map_id", 0)) != 51:
+                    break
+                if int(nav_now.get("y", 0)) >= 30:
+                    break
+                forest_budget -= 1
+                redirect, moved, reached = _script_press("down", "forest_entry_descent")
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    progressed = True
+                    any_progress = True
+
+            south_lanes = self._rotate_int_sequence([15, 14, 16, 13, 17, 12, 18], offset=variant_seed)
+            for align_x in south_lanes:
+                for _ in range(14):
+                    if forest_budget <= 0:
+                        break
+                    nav_now = self._nav_state()
+                    if int(nav_now.get("map_id", 0)) != 51:
+                        break
+                    x_now = int(nav_now.get("x", 0))
+                    if x_now == int(align_x):
+                        break
+                    forest_budget -= 1
+                    button = "right" if x_now < int(align_x) else "left"
+                    redirect, moved, reached = _script_press(button, "forest_lane_align")
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    if moved:
+                        progressed = True
+                        any_progress = True
+
+                stagnant = 0
+                for _ in range(56):
+                    if forest_budget <= 0:
+                        break
+                    nav_now = self._nav_state()
+                    if int(nav_now.get("map_id", 0)) != 51:
+                        break
+                    forest_budget -= 1
+                    redirect, moved, reached = _script_press("down", "forest_lane_down")
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    nav_after = self._nav_state()
+                    if moved:
+                        progressed = True
+                        any_progress = True
+                        stagnant = 0
+                    else:
+                        stagnant += 1
+                    if int(nav_after.get("map_id", 0)) != 51:
+                        break
+                    if stagnant >= 12:
+                        break
+                if int(self._nav_state().get("map_id", 0)) != 51 or forest_budget <= 0:
+                    break
+
+            nav_after_lane = self._nav_state()
+            if int(nav_after_lane.get("map_id", 0)) == 51:
+                fallback = (["left"] * 6) + (["down"] * 28) + (["right"] * 12) + (["down"] * 28)
+                if variant_seed % 2 == 1:
+                    fallback = (["right"] * 6) + (["down"] * 28) + (["left"] * 12) + (["down"] * 28)
+                for button in fallback:
+                    if forest_budget <= 0:
+                        break
+                    forest_budget -= 1
+                    redirect, moved, reached = _script_press(button, "forest_lane_fallback")
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    if moved:
+                        progressed = True
+                        any_progress = True
+                    if int(self._nav_state().get("map_id", 0)) != 51:
+                        break
+
+            if int(self._nav_state().get("map_id", 0)) == 51:
+                if progressed or any_progress:
+                    # Keep iterating scripted traversal before burning the whole run.
+                    return True, None
+                return True, self._trigger_recovery(
+                    reason="forest_to_pewter_script_failed",
+                    step_index=step_index,
+                    target_map_id=target_map_id,
+                )
+
+        nav = self._nav_state()
+        curr_map_id = int(nav.get("map_id", 0))
+        y_now = int(nav.get("y", 0))
+        if curr_map_id == 47:
+            self._emit(
+                "forest_to_pewter_script_gatehouse_bridge",
+                route_step_index=step_index,
+                target_map_id=target_map_id,
+                traverse_attempt=traverse_attempt,
+                traverse_current_map_id=curr_map_id,
+                traverse_current_y=y_now,
+            )
+            bridge_pattern = (
+                (["up"] * 18)
+                + (["left"] * 2)
+                + (["up"] * 12)
+                + (["right"] * 4)
+                + (["up"] * 12)
+                + (["left"] * 2)
+                + (["up"] * 10)
+            )
+            for button in bridge_pattern:
+                redirect, moved, reached = _script_press(button, "route2_gatehouse_bridge")
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+                nav_after = self._nav_state()
+                map_after = int(nav_after.get("map_id", 0))
+                if map_after in {13, 50, 2}:
+                    break
+                if map_after not in {47, 13, 50, 51, 2}:
+                    break
+            nav = self._nav_state()
+            curr_map_id = int(nav.get("map_id", 0))
+            y_now = int(nav.get("y", 0))
+
+        if curr_map_id == 50 and y_now > 20:
+            self._emit(
+                "forest_to_pewter_script_gate_descent",
+                route_step_index=step_index,
+                target_map_id=target_map_id,
+                traverse_attempt=traverse_attempt,
+                traverse_current_map_id=curr_map_id,
+                traverse_current_y=y_now,
+            )
+            progressed = False
+            stagnant = 0
+            for _ in range(56):
+                redirect, moved, reached = _script_press("down", "gate_descent")
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                nav_after = self._nav_state()
+                if moved:
+                    progressed = True
+                    stagnant = 0
+                    any_progress = True
+                else:
+                    stagnant += 1
+                after_map = int(nav_after.get("map_id", 0))
+                after_y = int(nav_after.get("y", 0))
+                if after_map == 13 and after_y <= 20:
+                    break
+                if after_map not in {50, 13, 47}:
+                    break
+                if stagnant >= 14:
+                    break
+            if not progressed:
+                return True, self._trigger_recovery(
+                    reason="forest_to_pewter_script_failed",
+                    step_index=step_index,
+                    target_map_id=target_map_id,
+                )
+
+        nav = self._nav_state()
+        curr_map_id = int(nav.get("map_id", 0))
+        y_now = int(nav.get("y", 0))
+        if curr_map_id not in {47, 50, 13}:
+            return True, None
+
+        if curr_map_id == 13 and y_now > 20:
+            self._emit(
+                "forest_to_pewter_script_route2_climb",
+                route_step_index=step_index,
+                target_map_id=target_map_id,
+                traverse_attempt=traverse_attempt,
+                traverse_current_map_id=curr_map_id,
+                traverse_current_y=y_now,
+            )
+            climb_stagnant = 0
+            for i in range(110):
+                redirect, moved, reached = _script_press("up", "route2_climb_up")
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                nav_after = self._nav_state()
+                map_after = int(nav_after.get("map_id", 0))
+                y_after = int(nav_after.get("y", 0))
+                if moved:
+                    any_progress = True
+                    climb_stagnant = 0
+                else:
+                    climb_stagnant += 1
+                if map_after != 13:
+                    break
+                if y_after <= 20:
+                    break
+                if climb_stagnant >= 8:
+                    nudge_cycle = ("left", "right", "right", "left", "left", "right")
+                    nudge = nudge_cycle[(i // 8) % len(nudge_cycle)]
+                    redirect, moved, reached = _script_press(nudge, "route2_climb_nudge")
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    if moved:
+                        any_progress = True
+                        climb_stagnant = 0
+
+        # Route2 north-pocket finite-state exploration.
+        self._emit(
+            "forest_to_pewter_script_route2_north",
+            route_step_index=step_index,
+            target_map_id=target_map_id,
+            traverse_attempt=traverse_attempt,
+            traverse_current_map_id=curr_map_id,
+            traverse_current_y=y_now,
+        )
+        total_budget = 840
+
+        def _budget_press(button: str, phase: str) -> tuple[int | None, bool, bool, bool]:
+            nonlocal total_budget
+            if total_budget <= 0:
+                return None, False, False, True
+            total_budget -= 1
+            redirect, moved, reached = _script_press(button, phase)
+            return redirect, moved, reached, False
+
+        nav_now = self._nav_state()
+        if int(nav_now.get("map_id", 0)) == 47:
+            for _ in range(96):
+                redirect, moved, reached, exhausted = _budget_press("up", "route2_gatehouse_up")
+                if exhausted:
+                    break
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+                nav_after = self._nav_state()
+                map_after = int(nav_after.get("map_id", 0))
+                if map_after in {13, 50, 2}:
+                    break
+                if map_after not in {47, 13, 50, 2}:
+                    break
+
+        if int(nav_now.get("map_id", 0)) == 50 and int(nav_now.get("y", 0)) <= 8:
+            gate_candidates = self._rotate_int_sequence([2, 3, 4, 5, 6, 7, 8, 1, 9], offset=variant_seed)
+            ranked_gate_candidates = sorted(
+                gate_candidates,
+                key=lambda lane: int(self.route2_gate_x_fail_counts.get(int(lane), 0)),
+            )
+            for gate_x in ranked_gate_candidates:
+                lane_fail = 0
+                for _ in range(10):
+                    nav_gate = self._nav_state()
+                    if int(nav_gate.get("map_id", 0)) != 50:
+                        break
+                    x_gate = int(nav_gate.get("x", 0))
+                    if x_gate == int(gate_x):
+                        break
+                    button = "right" if x_gate < int(gate_x) else "left"
+                    redirect, moved, reached, exhausted = _budget_press(button, "route2_gate_align")
+                    if exhausted:
+                        break
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    if moved:
+                        any_progress = True
+                for _ in range(18):
+                    redirect, moved, reached, exhausted = _budget_press("up", "route2_gate_up")
+                    if exhausted:
+                        break
+                    if redirect is not None:
+                        return True, redirect
+                    if reached:
+                        return True, None
+                    if moved:
+                        any_progress = True
+                    nav_after = self._nav_state()
+                    map_after = int(nav_after.get("map_id", 0))
+                    if map_after == 51:
+                        lane_fail += 1
+                        break
+                    if map_after == 13:
+                        break
+                    if map_after not in {50, 13, 51}:
+                        break
+                if lane_fail > 0:
+                    self.route2_gate_x_fail_counts[int(gate_x)] = (
+                        int(self.route2_gate_x_fail_counts.get(int(gate_x), 0)) + lane_fail
+                    )
+                else:
+                    prev = int(self.route2_gate_x_fail_counts.get(int(gate_x), 0))
+                    if prev > 0:
+                        self.route2_gate_x_fail_counts[int(gate_x)] = max(0, prev - 1)
+
+        core_lanes = [1, 2, 3, 7, 8, 9]
+        wide_lanes = [5, 11, 13, 15, 17, 19, 21, 23]
+        lane_plan = core_lanes + wide_lanes
+        if traverse_attempt % 2 == 0:
+            lane_plan = list(reversed(lane_plan))
+        lane_plan = self._rotate_int_sequence(lane_plan, offset=variant_seed)
+        lane_plan = sorted(
+            lane_plan,
+            key=lambda lane: int(self.route2_lane_fail_counts.get(int(lane), 0)),
+        )
+
+        for align_x in lane_plan:
+            lane_fail = 0
+            align_budget = 12 if align_x in core_lanes else 22
+            for _ in range(align_budget):
+                nav_now = self._nav_state()
+                map_now = int(nav_now.get("map_id", 0))
+                x_now = int(nav_now.get("x", 0))
+                y_now = int(nav_now.get("y", 0))
+                if map_now not in {13, 47, 50}:
+                    break
+                if x_now == int(align_x):
+                    break
+                button = "right" if x_now < int(align_x) else "left"
+                redirect, moved, reached, exhausted = _budget_press(button, "route2_align")
+                if exhausted:
+                    break
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+
+            probe_budget = 18 if align_x in core_lanes else 24
+            for _ in range(probe_budget):
+                redirect, moved, reached, exhausted = _budget_press("up", "route2_probe_up")
+                if exhausted:
+                    break
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+                nav_after = self._nav_state()
+                map_after = int(nav_after.get("map_id", 0))
+                y_after = int(nav_after.get("y", 0))
+                if map_after in {50, 51} and map_after != map_now:
+                    lane_fail += 1
+                if map_after not in {13, 47, 50}:
+                    break
+                if map_after == 50 and y_after >= 40:
+                    lane_fail += 1
+                    break
+
+            reset_budget = 3 if align_x in core_lanes else 2
+            for _ in range(reset_budget):
+                nav_now = self._nav_state()
+                if int(nav_now.get("map_id", 0)) != 13:
+                    break
+                if int(nav_now.get("y", 0)) > 20:
+                    break
+                redirect, moved, reached, exhausted = _budget_press("down", "route2_reset")
+                if exhausted:
+                    break
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+
+            if lane_fail >= 2:
+                self.route2_lane_fail_counts[int(align_x)] = (
+                    int(self.route2_lane_fail_counts.get(int(align_x), 0)) + 1
+                )
+            else:
+                prev = int(self.route2_lane_fail_counts.get(int(align_x), 0))
+                if prev > 0:
+                    self.route2_lane_fail_counts[int(align_x)] = max(0, prev - 1)
+
+            if total_budget <= 0:
+                break
+
+        sweep = (["left"] * 16) + (["right"] * 32) + (["left"] * 16)
+        for button in sweep:
+            redirect, moved, reached, exhausted = _budget_press(button, "route2_sweep")
+            if exhausted:
+                break
+            if redirect is not None:
+                return True, redirect
+            if reached:
+                return True, None
+            if moved:
+                any_progress = True
+
+            redirect, moved, reached, exhausted = _budget_press("up", "route2_sweep_up")
+            if exhausted:
+                break
+            if redirect is not None:
+                return True, redirect
+            if reached:
+                return True, None
+            if moved:
+                any_progress = True
+
+            nav_after_up = self._nav_state()
+            if int(nav_after_up.get("map_id", 0)) == 13 and int(nav_after_up.get("y", 0)) <= 8:
+                redirect, moved, reached, exhausted = _budget_press("down", "route2_sweep_down")
+                if exhausted:
+                    break
+                if redirect is not None:
+                    return True, redirect
+                if reached:
+                    return True, None
+                if moved:
+                    any_progress = True
+
+        if self._seek_expected_map(
+            expected_map_id=target_map_id,
+            step_index=step_index,
+            max_seek_steps=260,
+            suppress_regression=True,
+        ):
+            return True, None
+        if any_progress:
+            self._bump_forest_variant(step=1)
+            return True, None
+        return True, self._trigger_recovery(
+            reason="forest_to_pewter_script_failed",
+            step_index=step_index,
+            target_map_id=target_map_id,
+        )
+
     def _run_traverse_until_map(self, *, step_index: int, step: Dict[str, object]) -> int | None:
         target_map_id = int(step["target_map_id"])
         mode = str(step.get("mode", "wall_follow_ccw"))
@@ -1237,25 +2338,189 @@ class _Runtime:
         hold_frames = max(1, int(step["hold_frames"]))
 
         nav = self._nav_state()
-        if int(nav.get("map_id", -1)) == target_map_id:
+        if self._map_matches(int(nav.get("map_id", -1)), target_map_id):
             return None
 
         if mode != "wall_follow_ccw":
             raise RouteExecutionError(f"unsupported traverse mode at runtime: {mode}")
 
-        heading = "up"
+        attempt_key = (str(self.current_checkpoint_name), int(target_map_id))
+        traverse_attempt = int(self.traverse_attempt_counts.get(attempt_key, 0)) + 1
+        self.traverse_attempt_counts[attempt_key] = traverse_attempt
+        heading_cycle = ("up", "right", "left", "down")
+        heading = heading_cycle[(traverse_attempt - 1) % len(heading_cycle)]
         hand = "left"
-        hand_flipped = False
         no_move_cycles = 0
         seen_states: Dict[Tuple[int, int, int, str, str], int] = {}
+        stuck_events = 0
+        unique_positions: set[Tuple[int, int, int]] = set()
 
-        for _ in range(max_steps):
+        for i in range(max_steps):
             nav = self._nav_state()
             curr_map_id = int(nav.get("map_id", 0))
-            if curr_map_id == target_map_id:
+            if self._map_matches(curr_map_id, target_map_id):
                 return None
+            if (
+                self.phase4_scope == "integrated"
+                and int(target_map_id) == 51
+                and str(self.current_checkpoint_name) == "Route2_GateHouse"
+                and curr_map_id in {0, 1, 12, 43, 44}
+            ):
+                self._emit(
+                    "traverse_gatehouse_reacquire",
+                    route_step_index=step_index,
+                    target_map_id=target_map_id,
+                    traverse_current_map_id=curr_map_id,
+                    traverse_current_x=int(nav.get("x", 0)),
+                    traverse_current_y=int(nav.get("y", 0)),
+                    traverse_attempt=traverse_attempt,
+                    traverse_steps=i,
+                )
+                if self._seek_expected_map(
+                    expected_map_id=50,
+                    step_index=step_index,
+                    max_seek_steps=640,
+                    suppress_regression=True,
+                ):
+                    continue
+                return self._trigger_recovery(
+                    reason="traverse_gatehouse_map_lost",
+                    step_index=step_index,
+                    target_map_id=target_map_id,
+                    traverse_current_map_id=curr_map_id,
+                )
+            if (
+                self.phase4_scope == "route_only"
+                and int(target_map_id) == 2
+                and str(self.current_checkpoint_name) in {"Forest_To_Pewter", "Forest_Exit_Gate"}
+            ):
+                scripted, scripted_redirect = self._run_forest_to_pewter_script(
+                    step_index=step_index,
+                    hold_frames=hold_frames,
+                    target_map_id=target_map_id,
+                    traverse_attempt=traverse_attempt,
+                )
+                if scripted_redirect is not None:
+                    return scripted_redirect
+                if scripted:
+                    after_script_map = int(self._nav_state().get("map_id", 0))
+                    if self._map_matches(after_script_map, target_map_id):
+                        return None
+                    continue
+
+                y_now = int(nav.get("y", 0))
+                if curr_map_id in {1, 12} or (curr_map_id == 13 and y_now >= 66):
+                    self._emit(
+                        "traverse_offroute_reroute",
+                        route_step_index=step_index,
+                        target_map_id=target_map_id,
+                        traverse_current_map_id=curr_map_id,
+                        traverse_current_y=y_now,
+                        traverse_attempt=traverse_attempt,
+                    )
+                    self.no_progress_steps = 0
+                    self._reset_nav_memory()
+                    self.last_position = self._position_key()
+                    return self.current_block_start
+                if curr_map_id == 50 and y_now <= 6:
+                    self._emit(
+                        "traverse_north_gate_push",
+                        route_step_index=step_index,
+                        target_map_id=target_map_id,
+                        traverse_attempt=traverse_attempt,
+                        traverse_current_y=y_now,
+                    )
+                    for push_step in range(64):
+                        redirect = self._press_button(
+                            "up",
+                            hold_frames=hold_frames,
+                            step_index=step_index,
+                            suppress_no_progress=True,
+                        )
+                        if redirect is not None:
+                            return redirect
+                        after_nav = self._nav_state()
+                        after_map = int(after_nav.get("map_id", 0))
+                        if self._map_matches(after_map, target_map_id):
+                            return None
+                        if after_map not in {50, 47, 13, 2}:
+                            break
+                        if after_map == 13 and int(after_nav.get("y", 0)) >= 40:
+                            break
+                        if push_step > 0 and push_step % 16 == 0:
+                            self._emit(
+                                "traverse_north_gate_push_progress",
+                                route_step_index=step_index,
+                                target_map_id=target_map_id,
+                                traverse_current_map_id=after_map,
+                                traverse_current_y=int(after_nav.get("y", 0)),
+                                traverse_push_steps=push_step,
+                            )
+                if curr_map_id in {13, 47} and y_now <= 15:
+                    self._emit(
+                        "traverse_route2_north_push",
+                        route_step_index=step_index,
+                        target_map_id=target_map_id,
+                        traverse_attempt=traverse_attempt,
+                        traverse_current_y=y_now,
+                    )
+                    for push_step in range(64):
+                        redirect = self._press_button(
+                            "up",
+                            hold_frames=hold_frames,
+                            step_index=step_index,
+                            suppress_no_progress=True,
+                        )
+                        if redirect is not None:
+                            return redirect
+                        after_nav = self._nav_state()
+                        after_map = int(after_nav.get("map_id", 0))
+                        if self._map_matches(after_map, target_map_id):
+                            return None
+                        if after_map not in {13, 47, 50, 2}:
+                            break
+                        if after_map == 50 and int(after_nav.get("y", 0)) >= 40:
+                            break
+                if i > 0 and i % 256 == 0:
+                    seek_budget = min(420, max(120, max_steps - i))
+                    if self._seek_expected_map(
+                        expected_map_id=target_map_id,
+                        step_index=step_index,
+                        max_seek_steps=seek_budget,
+                        suppress_regression=True,
+                    ):
+                        return None
+            if (
+                self.phase4_scope == "route_only"
+                and self.current_checkpoint_expected_map_id >= 0
+                and self.current_checkpoint_name == "Viridian_Forest"
+                and not self._map_matches(curr_map_id, int(self.current_checkpoint_expected_map_id))
+            ):
+                if self._seek_expected_map(
+                    expected_map_id=int(self.current_checkpoint_expected_map_id),
+                    step_index=step_index,
+                    max_seek_steps=420,
+                    suppress_regression=True,
+                ):
+                    continue
+                return self._trigger_recovery(
+                    reason="traverse_map_lost",
+                    step_index=step_index,
+                    target_map_id=target_map_id,
+                    traverse_current_map_id=curr_map_id,
+                )
 
             pos = (curr_map_id, int(nav.get("x", 0)), int(nav.get("y", 0)))
+            unique_positions.add(pos)
+            if i > 0 and i % 256 == 0:
+                self._emit(
+                    "traverse_progress",
+                    route_step_index=step_index,
+                    target_map_id=target_map_id,
+                    traverse_steps=i,
+                    traverse_unique_positions=len(unique_positions),
+                    traverse_current_map_id=curr_map_id,
+                )
             state_key = (pos[0], pos[1], pos[2], heading, hand)
             seen_count = int(seen_states.get(state_key, 0)) + 1
             seen_states[state_key] = seen_count
@@ -1277,17 +2542,27 @@ class _Runtime:
             if moved:
                 heading = action
                 no_move_cycles = 0
-                if int(after[0]) == target_map_id:
+                stuck_events = 0
+                if self._map_matches(int(after[0]), target_map_id):
                     return None
             else:
                 no_move_cycles += 1
 
             if no_move_cycles >= 24 or seen_count >= 12:
-                if not hand_flipped:
-                    hand = "right" if hand == "left" else "left"
-                    hand_flipped = True
-                    no_move_cycles = 0
-                    seen_states.clear()
+                stuck_events += 1
+                hand = "right" if hand == "left" else "left"
+                no_move_cycles = 0
+                seen_states.clear()
+                if i % 32 == 0:
+                    redirect = self._press_button(
+                        "b",
+                        hold_frames=2,
+                        step_index=step_index,
+                        suppress_no_progress=True,
+                    )
+                    if redirect is not None:
+                        return redirect
+                if stuck_events <= 10:
                     continue
                 return self._trigger_recovery(
                     reason="traverse_loop_stuck",
@@ -1304,7 +2579,10 @@ class _Runtime:
     def _condition_met(self, condition: str, value: int | None = None) -> bool:
         nav = self._nav_state()
         if condition == "map_id_is":
-            return int(nav.get("map_id", -1)) == int(value if value is not None else -1)
+            return self._map_matches(
+                int(nav.get("map_id", -1)),
+                int(value if value is not None else -1),
+            )
         if condition == "not_in_battle":
             return int(nav.get("in_battle", 0)) == 0
         if condition == "in_battle":
@@ -1329,13 +2607,14 @@ class _Runtime:
             nav = self._nav_state()
             expected_map_id = int(step["expected_map_id"])
             current_map_id = int(nav.get("map_id", -1))
-            if current_map_id != expected_map_id:
+            if not self._map_matches(current_map_id, expected_map_id):
                 seek_ok = self._seek_expected_map(expected_map_id=expected_map_id, step_index=step_index)
                 if seek_ok:
                     self._mark_checkpoint_reached(
                         step_index=step_index,
                         checkpoint_name=str(step["name"]),
                         expected_map_id=expected_map_id,
+                        allowed_map_ids=[int(v) for v in step.get("allowed_map_ids", [])],
                     )
                     return None
                 return self._trigger_recovery(
@@ -1348,6 +2627,7 @@ class _Runtime:
                 step_index=step_index,
                 checkpoint_name=str(step["name"]),
                 expected_map_id=expected_map_id,
+                allowed_map_ids=[int(v) for v in step.get("allowed_map_ids", [])],
             )
             return None
 
@@ -1357,7 +2637,10 @@ class _Runtime:
             target_forward = int(step["steps"])
             start_map_id = int(self._nav_state().get("map_id", 0))
             next_checkpoint_map_id = self._next_checkpoint_expected_map_id(step_index)
-            if next_checkpoint_map_id is not None and next_checkpoint_map_id != start_map_id:
+            if (
+                next_checkpoint_map_id is not None
+                and not self._map_matches(start_map_id, int(next_checkpoint_map_id))
+            ):
                 seek_budget = max(320, target_forward * 48)
                 if self._seek_expected_map(
                     expected_map_id=next_checkpoint_map_id,
@@ -1399,8 +2682,8 @@ class _Runtime:
                         continue
                     if (
                         next_checkpoint_map_id is not None
-                        and next_checkpoint_map_id != start_map_id
-                        and int(after[0]) == next_checkpoint_map_id
+                        and not self._map_matches(start_map_id, int(next_checkpoint_map_id))
+                        and self._map_matches(int(after[0]), int(next_checkpoint_map_id))
                     ):
                         return None
                     moved_any = True
@@ -1448,6 +2731,30 @@ class _Runtime:
             return self._run_waypoint(step_index=step_index, step=step)
 
         if step_type == "traverse_until_map":
+            nav = self._nav_state()
+            if (
+                self.phase4_scope == "route_only"
+                and self.current_checkpoint_expected_map_id >= 0
+                and not self._checkpoint_map_allowed(int(nav.get("map_id", -1)))
+            ):
+                if self._seek_expected_map(
+                    expected_map_id=int(self.current_checkpoint_expected_map_id),
+                    step_index=step_index,
+                    max_seek_steps=640,
+                    suppress_regression=True,
+                ):
+                    self._emit(
+                        "traverse_checkpoint_reacquired",
+                        route_step_index=step_index,
+                        expected_map_id=int(self.current_checkpoint_expected_map_id),
+                    )
+                else:
+                    return self._trigger_recovery(
+                        reason="traverse_checkpoint_map_mismatch",
+                        step_index=step_index,
+                        expected_map_id=int(self.current_checkpoint_expected_map_id),
+                        allowed_map_ids=self.current_checkpoint_allowed_map_ids,
+                    )
             return self._run_traverse_until_map(step_index=step_index, step=step)
 
         if step_type == "press":
@@ -1510,7 +2817,13 @@ class _Runtime:
 
     def run(self) -> Dict[str, object]:
         self.emu.reset(state_path=self.start_state_path)
-        self.last_position = self._position_key()
+        nav = self._nav_state()
+        self.last_position = (
+            int(nav.get("map_id", 0)),
+            int(nav.get("x", 0)),
+            int(nav.get("y", 0)),
+        )
+        self.last_observed_map_id = int(nav.get("map_id", 0))
         step_index = 0
         run_status = "failed"
         target_reached = False
@@ -1554,6 +2867,10 @@ class _Runtime:
             run_status = "failed"
             target_reached = self._target_reached()
             failure_reason = str(exc)
+        except Exception as exc:
+            run_status = "failed"
+            target_reached = self._target_reached()
+            failure_reason = f"unhandled_exception:{exc.__class__.__name__}"
 
         final_constraint = self._party_constraint_status()
         if isinstance(final_constraint.get("snapshot"), dict):
@@ -1604,6 +2921,7 @@ class _Runtime:
         return {
             "run_status": run_status,
             "target": self.target,
+            "phase4_scope": self.phase4_scope,
             "target_reached": bool(target_reached),
             "start_state": str(self.start_state_path),
             "route_script": str(self.route_script_path),
@@ -1635,6 +2953,12 @@ class _Runtime:
             "active_level_final": int(self.last_party_snapshot.get("active_level", 0)),
             "party_species_ids_final": final_party_species,
             "party_levels_final": final_party_levels,
+            "observed_map_transitions": dict(sorted(self.observed_map_transitions.items())),
+            "forest_transition_profile": {
+                "edges": dict(sorted(self.forest_probe_edges.items())),
+                "phase_counts": dict(sorted(self.forest_probe_phase_counts.items())),
+                "samples": list(self.forest_probe_samples),
+            },
             "failure_reason": failure_reason,
         }
 
@@ -1649,6 +2973,7 @@ def run_phase4_route(
     max_steps: int = 15000,
     policy_mode: str = "hybrid",
     target: str = "gym_entrance",
+    phase4_scope: str = "integrated",
     wild_run_enabled: bool = True,
     wild_battle_mode: str = "run_first",
     farm_hp_threshold: float = 0.45,
@@ -1675,6 +3000,7 @@ def run_phase4_route(
             max_steps=max_steps,
             policy_mode=policy_mode,
             target=target,
+            phase4_scope=phase4_scope,
             wild_run_enabled=wild_run_enabled,
             wild_battle_mode=wild_battle_mode,
             farm_hp_threshold=farm_hp_threshold,

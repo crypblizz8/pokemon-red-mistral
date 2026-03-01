@@ -85,6 +85,9 @@ from pokemon.phase3_metrics import (
 )
 from pokemon.route_executor import RouteValidationError, load_route_script, run_phase4_route
 
+DEFAULT_PHASE4_FOREST_PROFILE_PATH = Path("artifacts/results/forest_transition_profile.json")
+DEFAULT_PHASE4_FOREST_PROBE_STEPS = 5000
+
 
 @dataclass
 class CheckResult:
@@ -862,9 +865,44 @@ def print_campaign_report(path: Path) -> None:
     print(f"- real_battles: {report['real_battles']}")
     print(f"- simulations: {report['simulations']}")
     print(f"- combined_total: {report['combined']}")
+    print(f"- movement_steps: {report.get('movement_steps', 0)}")
+    print(
+        f"- movement_steps_phase3: {report.get('phase3_steps', 0)} "
+        f"movement_steps_phase4: {report.get('phase4_steps', 0)}"
+    )
     print(f"- log_entries: {report['entries']}")
     if report["updated_at"]:
         print(f"- updated_at: {report['updated_at']}")
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _log_movement_campaign_run(
+    campaign_log_path: Path,
+    *,
+    phase: str,
+    source: str,
+    movement_steps: int,
+    metadata: Dict[str, object],
+) -> None:
+    try:
+        append_campaign_log_entry(
+            campaign_log_path,
+            kind="simulation",
+            count=1,
+            source=source,
+            movement_steps=max(0, _safe_int(movement_steps)),
+            phase=phase,
+            metadata=metadata,
+        )
+        print_campaign_report(campaign_log_path)
+    except Exception as exc:
+        print(f"[WARN] campaign log update failed: {exc}")
 
 
 def _episode_outcome_counts(rows: List[Dict[str, object]]) -> Dict[str, int]:
@@ -1474,6 +1512,44 @@ def run_phase3(args: argparse.Namespace) -> int:
         f"output={format_repo_relative(output_path)} "
         f"summary={format_repo_relative(summary_path)}"
     )
+    version_names = sorted(str(name) for name in versions.keys())
+    train_timesteps_total = 0
+    eval_steps_total = 0
+    eval_rows_total = 0
+    for version_payload in versions.values():
+        if not isinstance(version_payload, dict):
+            continue
+        train_stats = version_payload.get("train_stats")
+        if isinstance(train_stats, dict):
+            train_timesteps_total += _safe_int(train_stats.get("timesteps_requested"))
+        episode_rows = version_payload.get("episodes")
+        if isinstance(episode_rows, list):
+            eval_rows_total += len(episode_rows)
+            for row in episode_rows:
+                if isinstance(row, dict):
+                    eval_steps_total += _safe_int(row.get("episode_len"))
+    movement_steps = train_timesteps_total + eval_steps_total
+    _log_movement_campaign_run(
+        args.campaign_log_path,
+        phase="phase3",
+        source="phase3",
+        movement_steps=movement_steps,
+        metadata={
+            "phase": "phase3",
+            "model": "ppo",
+            "reward_versions": version_names,
+            "train_minutes": int(args.phase3_train_minutes),
+            "eval_episodes_config": int(args.phase3_eval_episodes),
+            "eval_state_count": len(eval_state_paths),
+            "eval_rows_logged": int(eval_rows_total),
+            "train_timesteps": int(train_timesteps_total),
+            "eval_steps": int(eval_steps_total),
+            "movement_steps": int(movement_steps),
+            "phase3_pass": bool(comparison.get("phase3_pass", False)),
+            "output_path": format_repo_relative(output_path),
+            "summary_path": format_repo_relative(summary_path),
+        },
+    )
     return 0
 
 
@@ -1577,6 +1653,45 @@ def _write_phase4_timelapse(results: Dict[str, object], timeline_path: Path, tim
         _format_phase4_timelapse(results, timeline_path),
         encoding="utf-8",
     )
+
+
+def _write_phase4_forest_profile(results: Dict[str, object], profile_path: Path) -> None:
+    raw = results.get("forest_transition_profile", {})
+    payload: Dict[str, object]
+    if isinstance(raw, dict):
+        payload = dict(raw)
+    else:
+        payload = {}
+    payload.setdefault("edges", {})
+    payload.setdefault("phase_counts", {})
+    payload.setdefault("samples", [])
+    payload["run_status"] = str(results.get("run_status", "failed"))
+    payload["target_reached"] = bool(results.get("target_reached", False))
+    payload["failure_reason"] = str(results.get("failure_reason", ""))
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _build_phase4_forest_probe_route_payload(max_steps: int) -> Dict[str, object]:
+    return {
+        "name": "phase4_forest_probe",
+        "targets": {"gym_entrance": {"map_id": 2}},
+        "steps": [
+            {
+                "type": "checkpoint",
+                "name": "Forest_To_Pewter",
+                "expected_map_id": 51,
+                "allowed_map_ids": [50, 13, 47],
+            },
+            {
+                "type": "traverse_until_map",
+                "target_map_id": 2,
+                "mode": "wall_follow_ccw",
+                "max_steps": int(max(1, max_steps)),
+                "hold_frames": 6,
+            },
+        ],
+    }
 
 
 def _phase4_run_succeeded(results: Dict[str, object]) -> bool:
@@ -1729,6 +1844,7 @@ def run_phase4_demo(args: argparse.Namespace) -> int:
         f"name={route_preview.get('name', 'unknown')} "
         f"steps={len(route_preview.get('steps', []))} "
         f"target={args.phase4_target} "
+        f"scope={args.phase4_scope} "
         "policy_mode=heuristic "
         f"wild_run_enabled={bool(args.phase4_wild_run_enabled)} "
         f"wild_battle_mode={args.phase4_wild_battle_mode} "
@@ -1767,6 +1883,7 @@ def run_phase4_demo(args: argparse.Namespace) -> int:
             max_steps=args.phase4_max_steps,
             policy_mode="heuristic",
             target=args.phase4_target,
+            phase4_scope=str(args.phase4_scope),
             wild_run_enabled=bool(args.phase4_wild_run_enabled),
             wild_battle_mode=str(args.phase4_wild_battle_mode),
             farm_hp_threshold=float(args.phase4_farm_hp_threshold),
@@ -1788,6 +1905,31 @@ def run_phase4_demo(args: argparse.Namespace) -> int:
     _write_phase4_timelapse(results, timeline_path, timelapse_path)
     _print_phase4_summary("[PHASE4_DEMO]", results, results_path, timeline_path)
     print(f"[PHASE4_DEMO] timelapse={format_repo_relative(timelapse_path)}")
+    _log_movement_campaign_run(
+        args.campaign_log_path,
+        phase="phase4",
+        source="phase4_demo",
+        movement_steps=_safe_int(results.get("steps_executed", 0)),
+        metadata={
+            "phase": "phase4",
+            "source_mode": "demo",
+            "target": str(args.phase4_target),
+            "scope": str(args.phase4_scope),
+            "policy_mode": "heuristic",
+            "run_status": str(results.get("run_status", "failed")),
+            "target_reached": bool(results.get("target_reached", False)),
+            "steps_executed": _safe_int(results.get("steps_executed", 0)),
+            "battles_fought": _safe_int(results.get("battles_fought", 0)),
+            "wild_battles": _safe_int(results.get("wild_battles", 0)),
+            "trainer_battles": _safe_int(results.get("trainer_battles", 0)),
+            "wild_run_attempts": _safe_int(results.get("wild_run_attempts", 0)),
+            "wild_run_successes": _safe_int(results.get("wild_run_successes", 0)),
+            "results_path": format_repo_relative(results_path),
+            "timeline_path": format_repo_relative(timeline_path),
+            "timelapse_path": format_repo_relative(timelapse_path),
+            "failure_reason": str(results.get("failure_reason", "")).strip(),
+        },
+    )
 
     if _phase4_run_succeeded(results):
         _persist_phase4_last_good(
@@ -1828,14 +1970,31 @@ def run_phase4(args: argparse.Namespace) -> int:
     if int(args.phase4_farm_max_consecutive_fights) < 1:
         print("[FAIL] phase4_farm_max_consecutive_fights must be >= 1.")
         return 1
+    if int(args.phase4_forest_probe_steps) < 1:
+        print("[FAIL] phase4_forest_probe_steps must be >= 1.")
+        return 1
+
+    route_script_path = Path(args.phase4_route_script)
+    probe_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+    if bool(args.phase4_forest_probe):
+        probe_tmpdir = tempfile.TemporaryDirectory(prefix="phase4_forest_probe_")
+        route_script_path = Path(probe_tmpdir.name) / "route.json"
+        probe_payload = _build_phase4_forest_probe_route_payload(
+            int(args.phase4_forest_probe_steps)
+        )
+        route_script_path.write_text(json.dumps(probe_payload, indent=2), encoding="utf-8")
 
     try:
-        route_preview = load_route_script(args.phase4_route_script)
+        route_preview = load_route_script(route_script_path)
     except RouteValidationError as exc:
         print(f"[FAIL] phase4 route validation failed: {exc}")
+        if probe_tmpdir is not None:
+            probe_tmpdir.cleanup()
         return 1
     except Exception as exc:
         print(f"[FAIL] unable to load phase4 route script: {exc}")
+        if probe_tmpdir is not None:
+            probe_tmpdir.cleanup()
         return 1
 
     prereqs: List[CheckResult] = [
@@ -1843,7 +2002,7 @@ def run_phase4(args: argparse.Namespace) -> int:
         check_dependencies(),
         check_file_exists_nonempty(args.rom_path, "rom_file"),
         check_file_exists_nonempty(args.phase4_start_state, "phase4_start_state"),
-        check_file_exists_nonempty(args.phase4_route_script, "phase4_route_script"),
+        check_file_exists_nonempty(route_script_path, "phase4_route_script"),
         check_nav_state_ready(args.rom_path, args.phase4_start_state, "phase4_start_state_check"),
     ]
     if args.phase4_policy_mode == "hybrid":
@@ -1853,6 +2012,8 @@ def run_phase4(args: argparse.Namespace) -> int:
         print_result(item)
     if not all(item.passed for item in prereqs):
         print("\nPhase4 start blocked by failed preflight checks.")
+        if probe_tmpdir is not None:
+            probe_tmpdir.cleanup()
         return 1
 
     print(
@@ -1860,12 +2021,19 @@ def run_phase4(args: argparse.Namespace) -> int:
         f"name={route_preview.get('name', 'unknown')} "
         f"steps={len(route_preview.get('steps', []))} "
         f"target={args.phase4_target} "
+        f"scope={args.phase4_scope} "
         f"policy_mode={args.phase4_policy_mode} "
         f"wild_run_enabled={bool(args.phase4_wild_run_enabled)} "
         f"wild_battle_mode={args.phase4_wild_battle_mode} "
         f"farm_hp_threshold={float(args.phase4_farm_hp_threshold):.2f} "
         f"farm_max_consecutive_fights={int(args.phase4_farm_max_consecutive_fights)}"
     )
+    if bool(args.phase4_forest_probe):
+        print(
+            "[PHASE4] forest_probe "
+            f"enabled=true probe_steps={int(args.phase4_forest_probe_steps)} "
+            f"profile={format_repo_relative(Path(args.phase4_forest_profile_path).expanduser().resolve())}"
+        )
 
     api_key = os.environ.get("MISTRAL_API_KEY", "").strip()
     if not api_key:
@@ -1889,11 +2057,12 @@ def run_phase4(args: argparse.Namespace) -> int:
             emu=emu,
             agent=agent,
             start_state_path=args.phase4_start_state,
-            route_script_path=args.phase4_route_script,
+            route_script_path=route_script_path,
             timeline_path=args.phase4_timeline_path,
             max_steps=args.phase4_max_steps,
             policy_mode=args.phase4_policy_mode,
             target=args.phase4_target,
+            phase4_scope=str(args.phase4_scope),
             wild_run_enabled=bool(args.phase4_wild_run_enabled),
             wild_battle_mode=str(args.phase4_wild_battle_mode),
             farm_hp_threshold=float(args.phase4_farm_hp_threshold),
@@ -1904,6 +2073,8 @@ def run_phase4(args: argparse.Namespace) -> int:
         )
     finally:
         emu.stop()
+        if probe_tmpdir is not None:
+            probe_tmpdir.cleanup()
 
     results_path = Path(args.phase4_results_path).expanduser().resolve()
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1912,6 +2083,8 @@ def run_phase4(args: argparse.Namespace) -> int:
     timeline_path = Path(args.phase4_timeline_path).expanduser().resolve()
     timelapse_path = Path(args.phase4_timelapse_path).expanduser().resolve()
     _write_phase4_timelapse(results, timeline_path, timelapse_path)
+    forest_profile_path = Path(args.phase4_forest_profile_path).expanduser().resolve()
+    _write_phase4_forest_profile(results, forest_profile_path)
     run_status = str(results.get("run_status", "failed"))
     target_reached = bool(results.get("target_reached", False))
     print(
@@ -1921,9 +2094,36 @@ def run_phase4(args: argparse.Namespace) -> int:
         f"timeline={format_repo_relative(timeline_path)}"
     )
     print(f"[PHASE4] timelapse={format_repo_relative(timelapse_path)}")
+    print(f"[PHASE4] forest_profile={format_repo_relative(forest_profile_path)}")
     failure_reason = str(results.get("failure_reason", "")).strip()
     if failure_reason:
         print(f"[PHASE4] failure_reason={failure_reason}")
+    _log_movement_campaign_run(
+        args.campaign_log_path,
+        phase="phase4",
+        source="phase4",
+        movement_steps=_safe_int(results.get("steps_executed", 0)),
+        metadata={
+            "phase": "phase4",
+            "source_mode": "standard",
+            "target": str(args.phase4_target),
+            "scope": str(args.phase4_scope),
+            "policy_mode": str(args.phase4_policy_mode),
+            "run_status": run_status,
+            "target_reached": bool(target_reached),
+            "steps_executed": _safe_int(results.get("steps_executed", 0)),
+            "battles_fought": _safe_int(results.get("battles_fought", 0)),
+            "wild_battles": _safe_int(results.get("wild_battles", 0)),
+            "trainer_battles": _safe_int(results.get("trainer_battles", 0)),
+            "wild_run_attempts": _safe_int(results.get("wild_run_attempts", 0)),
+            "wild_run_successes": _safe_int(results.get("wild_run_successes", 0)),
+            "results_path": format_repo_relative(results_path),
+            "timeline_path": format_repo_relative(timeline_path),
+            "timelapse_path": format_repo_relative(timelapse_path),
+            "forest_profile_path": format_repo_relative(forest_profile_path),
+            "failure_reason": failure_reason,
+        },
+    )
 
     return 0 if run_status == "success" else 1
 
@@ -2017,6 +2217,7 @@ def run_phase5_strength_probe(args: argparse.Namespace) -> Dict[str, object]:
                     max_steps=min(int(args.phase5_max_steps), 6000),
                     policy_mode="heuristic",
                     target=args.phase5_target,
+                    phase4_scope="integrated",
                     wild_run_enabled=True,
                     llm_turn_interval=max(1, int(args.llm_turn_interval)),
                     max_decision_calls=0,
@@ -2179,6 +2380,7 @@ def run_phase5(args: argparse.Namespace) -> int:
             max_steps=args.phase5_max_steps,
             policy_mode=args.phase5_policy_mode,
             target=args.phase5_target,
+            phase4_scope="integrated",
             wild_run_enabled=True,
             llm_turn_interval=args.llm_turn_interval,
             max_decision_calls=args.max_decision_calls,
@@ -2593,6 +2795,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Phase 4 battle policy mode (default: hybrid).",
     )
     parser.add_argument(
+        "--phase4-scope",
+        type=str,
+        default="route_only",
+        choices=["route_only", "integrated"],
+        help="Phase 4 execution scope: route-only 4A or integrated 4B behavior.",
+    )
+    parser.add_argument(
         "--phase4-results-path",
         type=Path,
         default=DEFAULT_PHASE4_RESULTS_PATH,
@@ -2609,6 +2818,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_PHASE4_TIMELAPSE_PATH,
         help=f"Phase 4 timelapse text path (default: {DEFAULT_PHASE4_TIMELAPSE_PATH}).",
+    )
+    parser.add_argument(
+        "--phase4-forest-profile-path",
+        type=Path,
+        default=DEFAULT_PHASE4_FOREST_PROFILE_PATH,
+        help=(
+            "Phase 4 forest transition profile JSON output path "
+            f"(default: {DEFAULT_PHASE4_FOREST_PROFILE_PATH})."
+        ),
+    )
+    parser.add_argument(
+        "--phase4-forest-probe",
+        type=parse_bool_arg,
+        default=False,
+        help=(
+            "Run a focused forest transition probe route instead of the full phase4 route "
+            "(default: false)."
+        ),
+    )
+    parser.add_argument(
+        "--phase4-forest-probe-steps",
+        type=int,
+        default=DEFAULT_PHASE4_FOREST_PROBE_STEPS,
+        help=(
+            "Max traverse steps for forest probe route generation "
+            f"(default: {DEFAULT_PHASE4_FOREST_PROBE_STEPS})."
+        ),
     )
     parser.add_argument(
         "--phase4-target",
